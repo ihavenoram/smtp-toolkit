@@ -1,4 +1,6 @@
-﻿<#
+﻿# SMTP Toolkit 1.0.1 - https://ihavenoram.com - https://github.com/ihavenoram/smtp-toolkit
+# MIT licence, (c) 2026 ihavenoram.com. If you publish something built on this, please credit ihavenoram.com.
+<#
     SMTP Toolkit - on-site mail sending diagnostics (WinForms)
     ----------------------------------------------------------
     A single-file tool for Windows PowerShell 5.1, built to be launched inside a
@@ -51,7 +53,7 @@ param(
 #  Nothing in here may touch WinForms or any $script: variable owned by the UI.
 # ===========================================================================
 
-function Get-StVersion { '1.0.0' }
+function Get-StVersion { '1.2.0' }
 
 function Get-StJsonMarkers { @{ Begin = '<<<SMTPDIAG_JSON_BEGIN>>>'; End = '<<<SMTPDIAG_JSON_END>>>' } }
 
@@ -296,15 +298,84 @@ function Write-StNote {
 function Get-StPresets {
     # SMTP2GO first because that is what this tool was built against, but the
     # shape is generic - anything with a host and a port list works.
+    #
+    # 'kind' changes how results are READ, not how they are measured:
+    #   generic         a hosted relay with SMTP AUTH (SMTP2GO, Google, ...)
+    #   exchange-onprem an internal Exchange server - internal CA certificates
+    #                   are normal, and failed logins count against an AD account
+    #   exo-smtpauth    Exchange Online client submission (smtp.office365.com)
+    #   exo-connector   Exchange Online MX on 25, authorised by an inbound
+    #                   connector that matches this site's public IP
+    # A blank server on exo-connector means "use the From domain's MX".
     [object[]]@(
-        [pscustomobject]@{ name = 'SMTP2GO - Australia'; server = 'mail-au.smtp2go.com'; explicit = @(2525,587,8025,80,25); implicit = @(465,8465,443); preferred = 2525 }
-        [pscustomobject]@{ name = 'SMTP2GO - Global (nearest)'; server = 'mail.smtp2go.com'; explicit = @(2525,587,8025,80,25); implicit = @(465,8465,443); preferred = 2525 }
-        [pscustomobject]@{ name = 'SMTP2GO - Europe'; server = 'mail-eu.smtp2go.com'; explicit = @(2525,587,8025,80,25); implicit = @(465,8465,443); preferred = 2525 }
-        [pscustomobject]@{ name = 'SMTP2GO - United States'; server = 'mail-us.smtp2go.com'; explicit = @(2525,587,8025,80,25); implicit = @(465,8465,443); preferred = 2525 }
-        [pscustomobject]@{ name = 'Microsoft 365'; server = 'smtp.office365.com'; explicit = @(587); implicit = @(); preferred = 587 }
-        [pscustomobject]@{ name = 'Google Workspace'; server = 'smtp.gmail.com'; explicit = @(587); implicit = @(465); preferred = 587 }
-        [pscustomobject]@{ name = 'Custom / other server'; server = ''; explicit = @(587,25,2525); implicit = @(465); preferred = 587 }
+        [pscustomobject]@{ name = 'SMTP2GO - Australia'; server = 'mail-au.smtp2go.com'; explicit = @(2525,587,8025,80,25); implicit = @(465,8465,443); preferred = 2525; kind = 'generic'; expectInternalCa = $false; serverHint = '' }
+        [pscustomobject]@{ name = 'SMTP2GO - Global (nearest)'; server = 'mail.smtp2go.com'; explicit = @(2525,587,8025,80,25); implicit = @(465,8465,443); preferred = 2525; kind = 'generic'; expectInternalCa = $false; serverHint = '' }
+        [pscustomobject]@{ name = 'SMTP2GO - Europe'; server = 'mail-eu.smtp2go.com'; explicit = @(2525,587,8025,80,25); implicit = @(465,8465,443); preferred = 2525; kind = 'generic'; expectInternalCa = $false; serverHint = '' }
+        [pscustomobject]@{ name = 'SMTP2GO - United States'; server = 'mail-us.smtp2go.com'; explicit = @(2525,587,8025,80,25); implicit = @(465,8465,443); preferred = 2525; kind = 'generic'; expectInternalCa = $false; serverHint = '' }
+        [pscustomobject]@{ name = 'Exchange Server (on-premises)'; server = ''; explicit = @(587,25); implicit = @(); preferred = 587; kind = 'exchange-onprem'; expectInternalCa = $true; serverHint = 'Enter the Exchange server name, e.g. mail.contoso.local' }
+        [pscustomobject]@{ name = 'Microsoft 365 - SMTP AUTH (587)'; server = 'smtp.office365.com'; explicit = @(587); implicit = @(); preferred = 587; kind = 'exo-smtpauth'; expectInternalCa = $false; serverHint = '' }
+        [pscustomobject]@{ name = 'Microsoft 365 - inbound connector (25)'; server = ''; explicit = @(25); implicit = @(); preferred = 25; kind = 'exo-connector'; expectInternalCa = $false; serverHint = 'Leave blank to use the From domain''s MX (*.mail.protection.outlook.com)' }
+        [pscustomobject]@{ name = 'Google Workspace'; server = 'smtp.gmail.com'; explicit = @(587); implicit = @(465); preferred = 587; kind = 'generic'; expectInternalCa = $false; serverHint = '' }
+        [pscustomobject]@{ name = 'Custom / other server'; server = ''; explicit = @(587,25,2525); implicit = @(465); preferred = 587; kind = 'generic'; expectInternalCa = $false; serverHint = '' }
     )
+}
+
+function Get-StReplyMeaning {
+    # One place that turns an SMTP reply into a sentence a technician can act
+    # on. The enhanced status code (5.7.57) carries far more than the basic one
+    # (530), and Exchange in particular overloads a handful of basic codes, so
+    # both are read. Meanings are the best-known ones; the server's own text is
+    # always shown beside them by the caller.
+    param([int]$Code, [string]$Text = '', [string]$Kind = 'generic', [bool]$HasCredentials = $false)
+
+    $enh = ''
+    if ($Text -match '\b([245]\.\d{1,3}\.\d{1,3})\b') { $enh = $Matches[1] }
+    $t = $Text
+
+    # --- Exchange Online
+    if ($enh -eq '5.7.139') {
+        if ($t -match '(?i)tenant') { return 'Exchange Online has SMTP AUTH (basic authentication) switched off for the whole tenant. An application that logs in with a username and password cannot send this way any more; use an inbound connector on port 25, authorised by this site''s public IP, instead.' }
+        if ($t -match '(?i)mailbox|user') { return 'SMTP AUTH is switched off for this mailbox in Exchange Online. It can be re-enabled per mailbox only while the tenant still permits basic authentication; otherwise use an inbound connector on port 25.' }
+        return 'Exchange Online refused basic authentication. SMTP AUTH with a username and password is disabled or retired for this tenant; an inbound connector on port 25 is the supported route for a device or application that cannot do OAuth.'
+    }
+    if ($enh -eq '5.7.64' -or $t -match '(?i)TenantAttribution') {
+        return 'Exchange Online could not attribute this connection to a tenant: no inbound connector matched the address this site connects from, so relaying to an outside recipient was refused. Add the IP shown in the Egress section to the connector, or check that the From domain is an accepted domain in the tenant.'
+    }
+    if ($enh -eq '5.7.708' -or $enh -eq '5.7.606' -or $enh -eq '5.7.511') {
+        return 'Exchange Online is refusing traffic from this IP address outright - it is on Microsoft''s block list, usually after spam was seen from it. This is not a connector setting; the address has to be delisted.'
+    }
+    if ($enh -eq '4.4.62') {
+        return 'The message reached the wrong Exchange Online tenant or region. The connector, or the MX host being used, belongs to a different organisation from the From domain.'
+    }
+
+    # --- Exchange on-premises (and Exchange generally)
+    if ($enh -eq '5.7.57' -or ($Code -eq 530 -and $t -match '(?i)not authenticated')) {
+        if ($HasCredentials) { return 'The server says the client is not authenticated - yet credentials were supplied. That means the login was rejected. System.Net.Mail.SmtpClient carries on after a failed login, so a WRONG PASSWORD surfaces here, at MAIL FROM, as "requires a secure connection or the client was not authenticated". Check the password before touching TLS settings.' }
+        return 'This connector requires authentication and none was offered. Either give the application a username and password, or have the Exchange administrator add this machine''s address to an anonymous relay connector.'
+    }
+    if ($enh -eq '5.7.54' -or ($Code -eq 550 -and $t -match '(?i)unable to relay')) {
+        return 'Exchange accepted the connection but will not relay to an outside recipient for this address. No receive connector grants anonymous relay to the IP this machine connects from. Internal recipients would probably still be accepted, which is why "it works for internal mail" is a common symptom.'
+    }
+    if ($enh -eq '5.7.60' -or $t -match '(?i)SendAsDenied') {
+        return 'The login worked, but this account is not allowed to send as the From address. Grant Send As on that mailbox, or make the From address the authenticated user''s own.'
+    }
+    if ($enh -eq '5.7.3' -or $enh -eq '5.7.8' -or $Code -eq 535) {
+        if ($Kind -eq 'exchange-onprem') { return 'Wrong username or password. On Exchange that is an Active Directory account, and every failed attempt counts towards its lockout threshold - this tool stops trying after the first rejection for that reason.' }
+        return 'Wrong username or password for this server. Check them against the provider portal - a mail user is usually not the same as the portal login.'
+    }
+    if ($enh -eq '5.7.1' -and $t -match '(?i)block|spamhaus|reputation') {
+        return 'The server rejected this IP on reputation. That is a block list problem, not a configuration one.'
+    }
+    if ($Code -eq 530 -or $enh -eq '5.7.0') {
+        return 'The server wants an encrypted channel (STARTTLS) before it will go further. On this port the application''s SSL / TLS option has to be on.'
+    }
+    if ($Code -eq 550 -and $t -match '(?i)relay') {
+        if ($HasCredentials) { return 'Logged in, but this account is still not permitted to relay to that recipient. Check the sending permissions on the account.' }
+        return 'The server will not relay for this recipient without authentication. No credentials were supplied, so this also settles the IP authentication question: the address this machine leaves from is NOT authorised. Either authorise it, or give the application a username and password.'
+    }
+    if ($Code -eq 550 -or $Code -eq 553) { return 'The address was refused. Check it is spelled correctly and that the domain exists before assuming a configuration fault.' }
+    if ($Code -eq 421 -or $Code -eq 451 -or $Code -eq 452) { return 'A temporary refusal - throttling, a busy server or greylisting. Retry later before changing anything.' }
+    return ''
 }
 
 function Get-StAppProfiles {
@@ -985,18 +1056,29 @@ function Open-StSession {
     $sec = Resolve-StSecurityMode -Mode $Security -Port $Port
     $conn = New-StConnection -Server $Server -Port $Port -Security $sec -Sink $Sink `
                              -IoTimeoutMs $IoTimeoutMs -ConnectTimeoutMs $ConnectTimeoutMs -SslProtocols $SslProtocols
-    [void](Connect-StSmtp -Conn $conn)
-
-    $greeting = Read-StGreeting -Conn $conn
-    $ehlo1 = Invoke-StEhlo -Conn $conn -HeloName $HeloName
+    $greeting = $null
+    $ehlo1 = $null
     $ehlo2 = $null
+    try {
+        [void](Connect-StSmtp -Conn $conn)
 
-    if ($sec -eq 'starttls') {
-        if (-not $ehlo1.startTls) {
-            throw ('{0}:{1} did not advertise STARTTLS. An application that requires an encrypted channel on this port will fail here.' -f $Server, $Port)
+        $greeting = Read-StGreeting -Conn $conn
+        $ehlo1 = Invoke-StEhlo -Conn $conn -HeloName $HeloName
+
+        if ($sec -eq 'starttls') {
+            if (-not $ehlo1.startTls) {
+                throw ('{0}:{1} did not advertise STARTTLS. An application that requires an encrypted channel on this port will fail here.' -f $Server, $Port)
+            }
+            [void](Invoke-StStartTls -Conn $conn)
+            $ehlo2 = Invoke-StEhlo -Conn $conn -HeloName $HeloName
         }
-        [void](Invoke-StStartTls -Conn $conn)
-        $ehlo2 = Invoke-StEhlo -Conn $conn -HeloName $HeloName
+    } catch {
+        # Every caller closes the session it is handed - but a throw here
+        # means nothing is handed back, so the socket would otherwise stay
+        # open until garbage collection. Exchange limits concurrent
+        # connections per source IP, and a sweep fails a lot of probes.
+        Close-StConnection -Conn $conn -NoQuit
+        throw
     }
 
     return [pscustomobject]@{
@@ -1174,6 +1256,55 @@ function Test-StDns {
     return (Set-StSectionTiming -Section (New-StSection -State 'measured' -Method 'System.Net.Dns plus a hosts file scan' -Rows $rows -Data $data) -StartedUtc $t0 -DurationSec $sw.Elapsed.TotalSeconds)
 }
 
+function Invoke-StDnsQuery {
+    # Public resolver first. From inside a customer network the AD-integrated
+    # zone often answers authoritatively for the public domain while holding no
+    # MX, SPF or DMARC records at all, so a local lookup reports them "missing"
+    # when they are perfectly fine on the internet. Falls back to the local
+    # resolver when outbound DNS to 1.1.1.1 is blocked.
+    [CmdletBinding()]
+    param([string]$Name, [string]$Type, [switch]$LocalOnly)
+    if (-not $LocalOnly) {
+        try {
+            $pub = @(Resolve-DnsName -Name $Name -Type $Type -Server '1.1.1.1' -DnsOnly -QuickTimeout -ErrorAction Stop)
+            if ($pub.Count -gt 0) { return $pub }
+        } catch { }
+    }
+    return @(Resolve-DnsName -Name $Name -Type $Type -DnsOnly -ErrorAction Stop)
+}
+
+function Resolve-StMx {
+    # The From domain's MX, publicly and locally, plus whether it is hosted in
+    # Exchange Online. The public answer is the one that matters for sending.
+    param([string]$Domain)
+    $out = [pscustomobject]@{
+        domain = $Domain; publicMx = [object[]]@(); localMx = [object[]]@()
+        best = ''; isExchangeOnline = $false; splitHorizon = $false; error = ''
+    }
+    if ([string]::IsNullOrWhiteSpace($Domain)) { $out.error = 'No domain to look up.'; return $out }
+    if (-not (Get-Command Resolve-DnsName -ErrorAction SilentlyContinue)) { $out.error = 'Resolve-DnsName is not available on this machine.'; return $out }
+
+    $pubList = @()
+    try {
+        $r = @(Resolve-DnsName -Name $Domain -Type MX -Server '1.1.1.1' -DnsOnly -QuickTimeout -ErrorAction Stop | Where-Object { $_.QueryType -eq 'MX' })
+        $pubList = @($r | Sort-Object Preference | ForEach-Object { [string]$_.NameExchange })
+    } catch { }
+    $locList = @()
+    try {
+        $r = @(Resolve-DnsName -Name $Domain -Type MX -DnsOnly -ErrorAction Stop | Where-Object { $_.QueryType -eq 'MX' })
+        $locList = @($r | Sort-Object Preference | ForEach-Object { [string]$_.NameExchange })
+    } catch { }
+
+    $out.publicMx = [object[]]$pubList
+    $out.localMx  = [object[]]$locList
+    if ($pubList.Count -gt 0) { $out.best = $pubList[0] } elseif ($locList.Count -gt 0) { $out.best = $locList[0] }
+    if (-not $out.best) { $out.error = ('No MX record found for {0}.' -f $Domain) }
+    $out.isExchangeOnline = ($out.best -match '(?i)\.mail\.protection\.outlook\.com\.?$')
+    $out.splitHorizon = ($pubList.Count -gt 0 -and ((@($pubList) -join ',') -ne (@($locList) -join ',')))
+    $out.best = $out.best.TrimEnd('.')
+    return $out
+}
+
 function Test-StSenderDns {
     # SPF / DKIM / DMARC for the sending domain. Transport can be perfect and
     # mail still vanish downstream, so a vendor-ready report has to cover this.
@@ -1193,7 +1324,7 @@ function Test-StSenderDns {
     $spf = ''; $dmarc = ''; $dkim = ''; $mx = @()
 
     try {
-        $txt = @(Resolve-DnsName -Name $domain -Type TXT -ErrorAction Stop)
+        $txt = @(Invoke-StDnsQuery -Name $domain -Type TXT -ErrorAction Stop)
         foreach ($r in $txt) {
             $s = ''
             if ($r.PSObject.Properties['Strings']) { $s = ($r.Strings -join '') }
@@ -1212,7 +1343,7 @@ function Test-StSenderDns {
     }
 
     try {
-        $d = @(Resolve-DnsName -Name ('_dmarc.{0}' -f $domain) -Type TXT -ErrorAction Stop)
+        $d = @(Invoke-StDnsQuery -Name ('_dmarc.{0}' -f $domain) -Type TXT -ErrorAction Stop)
         foreach ($r in $d) {
             $s = ''
             if ($r.PSObject.Properties['Strings']) { $s = ($r.Strings -join '') }
@@ -1229,7 +1360,7 @@ function Test-StSenderDns {
     $selectors += @('s1','s2','smtp2go','default','google','selector1','selector2','k1')
     foreach ($sel in ($selectors | Select-Object -Unique)) {
         try {
-            $k = @(Resolve-DnsName -Name ('{0}._domainkey.{1}' -f $sel, $domain) -Type TXT -ErrorAction Stop)
+            $k = @(Invoke-StDnsQuery -Name ('{0}._domainkey.{1}' -f $sel, $domain) -Type TXT -ErrorAction Stop)
             foreach ($r in $k) {
                 $s = ''
                 if ($r.PSObject.Properties['Strings']) { $s = ($r.Strings -join '') }
@@ -1246,14 +1377,14 @@ function Test-StSenderDns {
     }
 
     try {
-        $mxr = @(Resolve-DnsName -Name $domain -Type MX -ErrorAction Stop | Where-Object { $_.QueryType -eq 'MX' })
+        $mxr = @(Invoke-StDnsQuery -Name $domain -Type MX -ErrorAction Stop | Where-Object { $_.QueryType -eq 'MX' })
         $mx = @($mxr | Sort-Object Preference | ForEach-Object { ('{0} (pref {1})' -f $_.NameExchange, $_.Preference) })
         if ($mx.Count -gt 0) { $rows += New-StRow -Group 'Sender DNS' -Check 'MX' -Result ($mx -join ', ') -Basis 'server-reported' -Status 'info' -Detail 'Where replies to this domain are delivered. Not used for sending.' }
     } catch { }
 
     $sw.Stop()
     $data = [pscustomobject]@{ domain = $domain; spf = $spf; dmarc = $dmarc; dkim = $dkim; mx = [object[]]$mx }
-    return (Set-StSectionTiming -Section (New-StSection -State 'measured' -Method 'Resolve-DnsName TXT and MX lookups' -Rows $rows -Data $data `
+    return (Set-StSectionTiming -Section (New-StSection -State 'measured' -Method 'Resolve-DnsName TXT and MX lookups against 1.1.1.1, falling back to the local resolver' -Rows $rows -Data $data `
             -Caveats @('DKIM cannot be proven absent - selectors are not enumerable.')) -StartedUtc $t0 -DurationSec $sw.Elapsed.TotalSeconds)
 }
 
@@ -1578,7 +1709,12 @@ function Test-StTlsVersions {
 }
 
 function Test-StCertificate {
-    param([string]$Server, [int]$Port, [string]$Security, [string]$HeloName, $Sink = $null, [int]$IoTimeoutMs = 15000)
+    param([string]$Server, [int]$Port, [string]$Security, [string]$HeloName, $Sink = $null, [int]$IoTimeoutMs = 15000,
+          # On-prem Exchange routinely presents an internal-CA or self-signed
+          # certificate. That is normal there, so it must not read as TLS
+          # interception - but an untrusted chain is still reported, because
+          # SmtpClient will refuse it.
+          [bool]$ExpectInternalCa = $false)
     $t0 = (Get-Date).ToUniversalTime()
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
 
@@ -1618,7 +1754,16 @@ function Test-StCertificate {
     # The interception tell. Both a legitimate public CA and an inspecting proxy
     # produce a chain that validates; only the issuer distinguishes them.
     $intercept = $false
-    if ($c.selfSigned) {
+    if ($ExpectInternalCa -and ($c.selfSigned -or -not $c.issuerLooksPublic)) {
+        $kindWord = if ($c.selfSigned) { 'Self-signed' } else { ('Internal CA "{0}"' -f $c.issuerCn) }
+        $trustDetail = 'Normal for an on-premises Exchange server. Every client that sends through it has to trust that CA - and this machine does.'
+        $st = 'info'
+        if (-not $c.valid) {
+            $st = 'fail'
+            $trustDetail = 'Normal for an on-premises Exchange server, but THIS machine does not trust it. System.Net.Mail.SmtpClient will refuse the connection after STARTTLS with "The remote certificate is invalid according to the validation procedure". Install the issuing CA certificate in the machine''s Trusted Root store, or put a publicly issued certificate on the Exchange receive connector.'
+        }
+        $rows += New-StRow -Group 'Certificate' -Check 'Issuer' -Result ('{0} - expected for on-prem Exchange' -f $kindWord) -Basis 'inference' -Status $st -Detail $trustDetail
+    } elseif ($c.selfSigned) {
         $intercept = $true
         $rows += New-StRow -Group 'Certificate' -Check 'TLS interception' -Result 'Self-signed certificate presented' -Basis 'inference' -Status 'warn' `
             -Detail 'A public mail relay does not present a self-signed certificate. Something between this machine and the server is terminating TLS.'
@@ -1643,7 +1788,8 @@ function Test-StCertificate {
 function Test-StAuth {
     param(
         [string]$Server, [int]$Port, [string]$Security, [string]$HeloName,
-        [string]$Username, [string]$Password, $Sink = $null, [int]$IoTimeoutMs = 15000
+        [string]$Username, [string]$Password, $Sink = $null, [int]$IoTimeoutMs = 15000,
+        [string]$Kind = 'generic'
     )
     $t0 = (Get-Date).ToUniversalTime()
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
@@ -1660,6 +1806,17 @@ function Test-StAuth {
         $s = Open-StSession -Server $Server -Port $Port -Security $Security -HeloName $HeloName -Sink $Sink -IoTimeoutMs $IoTimeoutMs
         $mechs = @($s.caps.authMechs)
 
+        if ($mechs.Count -eq 0 -and $Kind -eq 'exo-connector') {
+            # Expected, not a fault: an Exchange Online MX host never offers a
+            # login. The connector authorises by IP. Measured against the real
+            # class: SmtpClient with credentials set simply skips AUTH when none
+            # is offered, so an application that insists on a username and
+            # password still works through a connector.
+            $rows += New-StRow -Group 'Authentication' -Check 'AUTH offered' -Result 'None - as expected for an Exchange Online MX' -Basis 'server-reported' -Status 'info' `
+                -Detail 'Authorisation on this route is the inbound connector matching this site''s public IP. Any username and password the application holds are ignored: System.Net.Mail.SmtpClient skips AUTH when the server offers none. See the Relay tab.'
+            $sw.Stop()
+            return (Set-StSectionTiming -Section (New-StSection -State 'skipped' -Reason 'The Exchange Online MX offers no login; this route is authorised by connector IP, so there is nothing to authenticate.' -Method 'EHLO capability inspection' -Rows $rows) -StartedUtc $t0 -DurationSec $sw.Elapsed.TotalSeconds)
+        }
         if ($mechs.Count -eq 0) {
             $rows += New-StRow -Group 'Authentication' -Check 'AUTH offered' -Result 'None advertised' -Basis 'server-reported' -Status 'fail' `
                 -Detail 'The server offers no authentication on this port in this state. An application that insists on supplying a username and password has nowhere to send them.'
@@ -1668,6 +1825,11 @@ function Test-StAuth {
         }
 
         $rows += New-StRow -Group 'Authentication' -Check 'Mechanisms offered' -Result ($mechs -join ' ') -Basis 'server-reported' -Status 'ok'
+        $winMech = @($mechs | Where-Object { $_ -eq 'GSSAPI' -or $_ -eq 'NTLM' })
+        if ($winMech.Count -gt 0) {
+            $rows += New-StRow -Group 'Authentication' -Check 'What the application will use' -Result ('{0} first, then LOGIN' -f $winMech[0]) -Basis 'measured' -Status 'warn' `
+                -Detail ('Measured against the real class: System.Net.Mail.SmtpClient tries {0} before LOGIN whenever it is offered, and falls back to LOGIN if that fails. This test uses LOGIN or PLAIN, so its answer can differ from the application''s - confirm with Reproduce app send. It also means a wrong password costs TWO failed logins per send, which matters against an Active Directory lockout policy.' -f $winMech[0])
+        }
         $rows += New-StRow -Group 'Authentication' -Check 'Channel' -Result $(if ($s.conn.Secure) { ('Encrypted ({0})' -f $s.conn.Tls.protocol) } else { 'PLAINTEXT' }) `
             -Status $(if ($s.conn.Secure) { 'ok' } else { 'warn' }) `
             -Detail $(if ($s.conn.Secure) { '' } else { 'Credentials would cross the network unprotected. Most servers refuse AUTH here, which an application usually reports as a login failure rather than a security one.' })
@@ -1677,10 +1839,9 @@ function Test-StAuth {
             $rows += New-StRow -Group 'Authentication' -Check ('AUTH {0}' -f $result.mech) -Result ('Accepted ({0})' -f $result.code) -Status 'ok' `
                 -Detail 'These credentials are valid for this server. A send failure from here is not a password problem.'
         } else {
-            $detail = 'The server rejected these credentials.'
-            if ($result.code -eq 535) { $detail = 'Wrong username or password for this server. Check them against the provider portal - a mail user is usually not the same as the portal login.' }
-            elseif ($result.code -eq 530) { $detail = 'The server demanded an encrypted channel before accepting AUTH. On this port the application must enable TLS/SSL.' }
-            elseif ($result.code -eq 538) { $detail = 'The server requires encryption for this mechanism.' }
+            $detail = Get-StReplyMeaning -Code $result.code -Text $result.text -Kind $Kind -HasCredentials $true
+            if (-not $detail) { $detail = 'The server rejected these credentials.' }
+            if ($result.code -eq 538) { $detail = 'The server requires encryption for this mechanism.' }
             $rows += New-StRow -Group 'Authentication' -Check ('AUTH {0}' -f $result.mech) -Result ('REJECTED ({0})' -f $result.code) -Status 'fail' -Detail ('{0} Server said: {1}' -f $detail, $result.text)
         }
     } catch {
@@ -1695,7 +1856,7 @@ function Test-StAuth {
     $data = [pscustomobject]@{
         port = $Port; mechanismsOffered = [object[]]@($s.caps.authMechs)
         mechanismUsed = $result.mech; accepted = $result.success; code = $result.code
-        encrypted = $s.conn.Secure
+        text = $result.text; encrypted = $s.conn.Secure
     }
     $state = if ($result.success) { 'measured' } else { 'failed' }
     $reason = if ($result.success) { '' } else { ('The server rejected the credentials with {0}.' -f $result.code) }
@@ -1709,10 +1870,11 @@ function Test-StEnvelope {
     param(
         [string]$Server, [int]$Port, [string]$Security, [string]$HeloName,
         [string]$Username, [string]$Password, [string]$From, [string]$To,
-        $Sink = $null, [int]$IoTimeoutMs = 15000
+        $Sink = $null, [int]$IoTimeoutMs = 15000, [string]$Kind = 'generic'
     )
     $t0 = (Get-Date).ToUniversalTime()
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $hasCreds = (-not [string]::IsNullOrEmpty($Username)) -or (-not [string]::IsNullOrEmpty($Password))
 
     if (-not (Test-StEmailAddress $From)) { return (New-StSection -State 'skipped' -Reason 'A valid From address is needed before the envelope can be tested.') }
     if (-not (Test-StEmailAddress $To))   { return (New-StSection -State 'skipped' -Reason 'A valid To address is needed before the envelope can be tested.') }
@@ -1725,11 +1887,17 @@ function Test-StEnvelope {
         Write-StNote $Sink ('--- Envelope test on {0}:{1} (no message will be delivered) ---' -f $Server, $Port)
         $s = Open-StSession -Server $Server -Port $Port -Security $Security -HeloName $HeloName -Sink $Sink -IoTimeoutMs $IoTimeoutMs
 
-        if (-not [string]::IsNullOrEmpty($Username) -or -not [string]::IsNullOrEmpty($Password)) {
+        if ($hasCreds -and @($s.caps.authMechs).Count -eq 0) {
+            # Same as SmtpClient: credentials held but no login offered means
+            # carry on unauthenticated rather than fail.
+            $rows += New-StRow -Group 'Envelope' -Check 'Authentication' -Result 'Skipped - the server offers no login' -Basis 'measured' -Status 'info' `
+                -Detail 'System.Net.Mail.SmtpClient does exactly this: with credentials set and no AUTH offered, it sends without logging in. Authorisation then has to come from the connection itself - an IP-scoped connector.'
+        } elseif ($hasCreds) {
             $a = Invoke-StAuthenticate -Conn $s.conn -Username $Username -Password $Password
             $authOk = $a.success
             if (-not $a.success) {
-                $rows += New-StRow -Group 'Envelope' -Check 'Authentication' -Result ('REJECTED ({0})' -f $a.code) -Status 'fail' -Detail $a.text
+                $am = Get-StReplyMeaning -Code $a.code -Text $a.text -Kind $Kind -HasCredentials $true
+                $rows += New-StRow -Group 'Envelope' -Check 'Authentication' -Result ('REJECTED ({0})' -f $a.code) -Status 'fail' -Detail (('{0}  {1}' -f $a.text, $am).Trim())
                 $sw.Stop()
                 return (Set-StSectionTiming -Section (New-StSection -State 'failed' -Reason ('Could not authenticate, so the envelope was never offered: {0}' -f $a.text) -Method 'MAIL FROM / RCPT TO with no DATA' -Rows $rows) -StartedUtc $t0 -DurationSec $sw.Elapsed.TotalSeconds)
             }
@@ -1746,8 +1914,9 @@ function Test-StEnvelope {
                 -Detail 'The server is willing to relay for this sender. That covers sender-domain verification and, where it applies, IP authentication.'
         } else {
             $d = $envRes.mailFromText
-            if ($envRes.mailFromCode -eq 550 -or $envRes.mailFromCode -eq 553) { $d = ('{0}  The sending domain is most likely not verified with the provider, or this account is not permitted to send as it.' -f $d) }
-            elseif ($envRes.mailFromCode -eq 530) { $d = ('{0}  The server wants authentication first. If the application cannot be given credentials, IP authentication has to be working instead.' -f $d) }
+            $mm = Get-StReplyMeaning -Code $envRes.mailFromCode -Text $envRes.mailFromText -Kind $Kind -HasCredentials $hasCreds
+            if ($mm) { $d = ('{0}  {1}' -f $d, $mm) }
+            elseif ($envRes.mailFromCode -eq 550 -or $envRes.mailFromCode -eq 553) { $d = ('{0}  The sending domain is most likely not verified with the provider, or this account is not permitted to send as it.' -f $d) }
             $rows += New-StRow -Group 'Envelope' -Check ('MAIL FROM <{0}>' -f $From) -Result ('REJECTED ({0})' -f $envRes.mailFromCode) -Status 'fail' -Detail $d
         }
 
@@ -1760,15 +1929,8 @@ function Test-StEnvelope {
                 # that is also the definitive answer on IP authentication:
                 # this egress address is not on the authorised list.
                 $rd = $envRes.rcptToText
-                if ($envRes.rcptToCode -eq 550 -and $envRes.rcptToText -match '(?i)relay|authenticat') {
-                    if ([string]::IsNullOrEmpty($Username) -and [string]::IsNullOrEmpty($Password)) {
-                        $rd = ('{0}  The server will not relay for this recipient without authentication. Since no credentials were supplied, this also settles the IP authentication question: the address this machine leaves from is NOT authorised with the provider. Either add it there, or give the application a username and password.' -f $rd)
-                    } else {
-                        $rd = ('{0}  The credentials were accepted but this account is still not permitted to relay to that recipient. Check the sending permissions on the provider account.' -f $rd)
-                    }
-                } elseif ($envRes.rcptToCode -eq 550) {
-                    $rd = ('{0}  The recipient itself was refused - check the address before assuming a configuration fault.' -f $rd)
-                }
+                $rm = Get-StReplyMeaning -Code $envRes.rcptToCode -Text $envRes.rcptToText -Kind $Kind -HasCredentials ($hasCreds -and [bool]$authOk)
+                if ($rm) { $rd = ('{0}  {1}' -f $rd, $rm) }
                 $rows += New-StRow -Group 'Envelope' -Check ('RCPT TO <{0}>' -f $To) -Result ('REJECTED ({0})' -f $envRes.rcptToCode) -Status 'fail' -Detail $rd
             }
         }
@@ -1789,11 +1951,411 @@ function Test-StEnvelope {
     $data = [pscustomobject]@{
         port = $Port; from = $From; to = $To; authenticated = $authOk
         mailFromCode = $envRes.mailFromCode; rcptToCode = $envRes.rcptToCode; accepted = $envRes.success
+        mailFromText = $envRes.mailFromText; rcptToText = $envRes.rcptToText
     }
     $state = if ($envRes.success) { 'measured' } else { 'failed' }
     $reason = if ($envRes.success) { '' } else { 'The server refused the envelope. The row detail carries its exact reply.' }
     return (Set-StSectionTiming -Section (New-StSection -State $state -Reason $reason -Method 'MAIL FROM / RCPT TO / RSET - no DATA, nothing delivered' -Rows $rows -Data $data `
             -Caveats @('Acceptance of an envelope is not delivery. Content filtering and recipient rules act after this point.')) -StartedUtc $t0 -DurationSec $sw.Elapsed.TotalSeconds)
+}
+
+function Test-StRelay {
+    # Anonymous relay: no credentials, an EXTERNAL recipient, stop before DATA.
+    #
+    # This is how scanners, copiers and line-of-business applications usually
+    # send through on-prem Exchange (an IP-scoped relay connector) and through
+    # Exchange Online (an inbound connector matching the site's public IP, on
+    # port 25 to the tenant's MX host).
+    #
+    # The recipient has to be outside the organisation. Exchange Online accepts
+    # mail for its own users from anyone ("direct send"), and on-prem Exchange
+    # accepts internal recipients anonymously by default, so an internal
+    # recipient succeeds whether or not any connector exists - it proves
+    # nothing about the thing being tested.
+    param(
+        [string]$Server, [int]$Port = 25, [string]$HeloName,
+        [string]$From, [string]$ExternalTo,
+        [string[]]$ExpectedIps = @(), [string]$PublicIp = '',
+        [string]$Kind = 'generic', [bool]$PortOpen = $true,
+        $Sink = $null, [int]$IoTimeoutMs = 15000
+    )
+    $t0 = (Get-Date).ToUniversalTime()
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+
+    if (-not (Test-StEmailAddress $From))       { return (New-StSection -State 'skipped' -Reason 'A valid From address is needed for the relay test.') }
+    if (-not (Test-StEmailAddress $ExternalTo)) { return (New-StSection -State 'skipped' -Reason 'Enter an external recipient on the Relay tab - an address outside this organisation, such as your own.') }
+
+    $rows = @()
+    $routeWord = if ($Kind -eq 'exo-connector') { 'inbound connector' } else { 'relay connector' }
+    $fromDom = (Get-StDomainFromAddress $From).ToLowerInvariant()
+    $toDom   = (Get-StDomainFromAddress $ExternalTo).ToLowerInvariant()
+    $internal = ($fromDom -and $fromDom -eq $toDom)
+    if ($internal) {
+        $rows += New-StRow -Group 'Relay' -Check 'Recipient' -Result ('{0} is in the sender''s own domain' -f $ExternalTo) -Status 'warn' `
+            -Detail 'An internal recipient is accepted with or without a connector, so a pass here would prove nothing. Use an address outside the organisation.'
+    }
+
+    if (-not $PortOpen) {
+        $why = ('Port {0} did not accept a connection.' -f $Port)
+        if ($Port -eq 25) { $why = 'Outbound port 25 is blocked from this site. Most often that is the ISP - residential and many business services block it to stop spam - or the site firewall. The connector cannot work until 25 is open to the mail host.' }
+        $rows += New-StRow -Group 'Relay' -Check ('Port {0}' -f $Port) -Result 'CLOSED or FILTERED' -Status 'fail' -Detail $why
+        $sw.Stop()
+        $data = [pscustomobject]@{ port = $Port; portOpen = $false; accepted = $false; seenIp = ''; expectedIps = [object[]]$ExpectedIps; internalRecipient = $internal }
+        return (Set-StSectionTiming -Section (New-StSection -State 'failed' -Reason $why -Method 'Anonymous MAIL FROM / RCPT TO to an external recipient' -Rows $rows -Data $data) -StartedUtc $t0 -DurationSec $sw.Elapsed.TotalSeconds)
+    }
+
+    $conn = $null
+    $tlsUsed = $false
+    $seenIp = ''
+    $envRes = $null
+    $meaning = ''
+    try {
+        Write-StNote $Sink ('--- Relay test on {0}:{1}, no credentials, external recipient (nothing is delivered) ---' -f $Server, $Port)
+        # Plaintext first, upgrading only if STARTTLS is offered. A relay
+        # connector without TLS is legal - and worth knowing about - so its
+        # absence is reported, not treated as a connection failure.
+        $conn = New-StConnection -Server $Server -Port $Port -Security 'none' -Sink $Sink -IoTimeoutMs $IoTimeoutMs
+        [void](Connect-StSmtp -Conn $conn)
+        $g = Read-StGreeting -Conn $conn
+        if ($g.code -ne 220) { throw ('The server greeted with {0}: {1}' -f $g.code, ($g.lines -join ' ')) }
+        $e = Invoke-StEhlo -Conn $conn -HeloName $HeloName
+        if ($e.startTls) {
+            [void](Invoke-StStartTls -Conn $conn)
+            $tlsUsed = $true
+            $e = Invoke-StEhlo -Conn $conn -HeloName $HeloName
+        }
+        $seenIp = $conn.RemoteIpSeen
+        $rows += New-StRow -Group 'Relay' -Check 'Encryption' -Result $(if ($tlsUsed) { ('STARTTLS, {0}' -f $conn.Tls.protocol) } else { 'None offered' }) `
+            -Status $(if ($tlsUsed) { 'ok' } else { 'warn' }) `
+            -Detail $(if ($tlsUsed) { '' } else { 'The server did not offer STARTTLS on this port, so mail would cross the network unencrypted. Untick SSL in the application for this route, or ask for TLS to be enabled on the connector.' })
+
+        $envRes = Invoke-StEnvelope -Conn $conn -From $From -To $ExternalTo
+    } catch {
+        $rows += New-StRow -Group 'Relay' -Check 'Session' -Result 'FAILED' -Status 'fail' -Detail $_.Exception.Message
+        $sw.Stop()
+        $data = [pscustomobject]@{ port = $Port; portOpen = $true; accepted = $false; seenIp = $seenIp; expectedIps = [object[]]$ExpectedIps; internalRecipient = $internal; error = $_.Exception.Message }
+        return (Set-StSectionTiming -Section (New-StSection -State 'failed' -Reason $_.Exception.Message -Method 'Anonymous MAIL FROM / RCPT TO to an external recipient' -Rows $rows -Data $data) -StartedUtc $t0 -DurationSec $sw.Elapsed.TotalSeconds)
+    } finally {
+        if ($conn) { Close-StConnection -Conn $conn }
+    }
+
+    # Which address the server attributes us to. That - not what a "what is my
+    # IP" page says - is what a connector is matched against.
+    $expected = @($ExpectedIps | Where-Object { $_ } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    $ipMatch = $null
+    if ($seenIp) {
+        $ipDetail = 'Taken from the server''s EHLO reply. This is the address the connector is matched against.'
+        $ipStatus = 'info'
+        if ($expected.Count -gt 0) {
+            $ipMatch = ($expected -contains $seenIp)
+            if ($ipMatch) {
+                $ipStatus = 'ok'
+                $ipDetail = ('Matches the connector address you entered ({0}).' -f ($expected -join ', '))
+            } else {
+                $ipStatus = 'fail'
+                $ipDetail = ('The connector is set for {0}, but this site is arriving as {1}. Typical causes are a second internet connection, a failover link, or an ISP change. Add {1} to the connector.' -f ($expected -join ', '), $seenIp)
+            }
+        }
+        $rows += New-StRow -Group 'Relay' -Check 'Address the server sees' -Result $seenIp -Basis 'server-reported' -Status $ipStatus -Detail $ipDetail
+        if ($PublicIp -and $PublicIp -ne $seenIp) {
+            $rows += New-StRow -Group 'Relay' -Check 'Web egress address' -Result $PublicIp -Status 'warn' `
+                -Detail ('Web traffic leaves as {0} but SMTP arrives as {1}. If the connector was set up from a "what is my IP" page, it will have the wrong address.' -f $PublicIp, $seenIp)
+        }
+    } else {
+        $rows += New-StRow -Group 'Relay' -Check 'Address the server sees' -Result 'Not reported by the server' -Basis 'not measured' -Status 'info' `
+            -Detail $(if ($PublicIp) { ('The server did not echo an address. This site''s web egress is {0}, which is the best available guess.' -f $PublicIp) } else { 'The server did not echo an address in its EHLO reply.' })
+    }
+
+    if ($envRes.mailFromCode -eq 250) {
+        $rows += New-StRow -Group 'Relay' -Check ('MAIL FROM <{0}>' -f $From) -Result 'Accepted (250)' -Status 'ok'
+    } else {
+        $meaning = Get-StReplyMeaning -Code $envRes.mailFromCode -Text $envRes.mailFromText -Kind $Kind -HasCredentials $false
+        $rows += New-StRow -Group 'Relay' -Check ('MAIL FROM <{0}>' -f $From) -Result ('REJECTED ({0})' -f $envRes.mailFromCode) -Status 'fail' -Detail (('{0}  {1}' -f $envRes.mailFromText, $meaning).Trim())
+    }
+    if ($envRes.rcptToCode -ne 0) {
+        if ($envRes.rcptToCode -eq 250 -or $envRes.rcptToCode -eq 251) {
+            $rows += New-StRow -Group 'Relay' -Check ('RCPT TO <{0}> (external)' -f $ExternalTo) -Result ('Accepted ({0})' -f $envRes.rcptToCode) -Status 'ok'
+        } else {
+            $meaning = Get-StReplyMeaning -Code $envRes.rcptToCode -Text $envRes.rcptToText -Kind $Kind -HasCredentials $false
+            $rows += New-StRow -Group 'Relay' -Check ('RCPT TO <{0}> (external)' -f $ExternalTo) -Result ('REJECTED ({0})' -f $envRes.rcptToCode) -Status 'fail' -Detail (('{0}  {1}' -f $envRes.rcptToText, $meaning).Trim())
+        }
+    }
+
+    $accepted = [bool]$envRes.success
+    $who = if ($seenIp) { $seenIp } elseif ($PublicIp) { $PublicIp } else { 'this site' }
+    if ($accepted -and -not $internal) {
+        $rows += New-StRow -Group 'Relay' -Check 'Outcome' -Result ('The {0} accepts {1}' -f $routeWord, $who) -Basis 'inference' -Status 'ok' `
+            -Detail ('An application on this machine can send to outside recipients through {0}:{1} with no username or password{2}. The session was reset before DATA, so nothing was delivered.' -f $Server, $Port, $(if ($tlsUsed) { ', SSL ticked' } else { '' }))
+    } elseif ($accepted) {
+        $rows += New-StRow -Group 'Relay' -Check 'Outcome' -Result 'Accepted, but only for an internal recipient' -Basis 'inference' -Status 'warn' `
+            -Detail 'This would have succeeded without any connector. Re-run with an external recipient to test the connector itself.'
+    } else {
+        $rows += New-StRow -Group 'Relay' -Check 'Outcome' -Result ('The {0} does not accept {1}' -f $routeWord, $who) -Basis 'inference' -Status 'fail' `
+            -Detail $(if ($meaning) { $meaning } else { 'The server refused to relay. See the reply above.' })
+    }
+
+    $sw.Stop()
+    $data = [pscustomobject]@{
+        port = $Port; portOpen = $true; tlsUsed = $tlsUsed
+        seenIp = $seenIp; publicIp = $PublicIp; expectedIps = [object[]]$expected; ipMatchesExpected = $ipMatch
+        mailFromCode = $envRes.mailFromCode; mailFromText = $envRes.mailFromText
+        rcptToCode = $envRes.rcptToCode; rcptToText = $envRes.rcptToText
+        accepted = ($accepted -and -not $internal); internalRecipient = $internal; meaning = $meaning
+        route = $routeWord; server = $Server
+    }
+    $state = if ($accepted -and -not $internal) { 'measured' } else { 'failed' }
+    $reason = if ($state -eq 'measured') { '' } elseif ($internal) { 'Only an internal recipient was tried, which proves nothing about a connector.' } else { ('Relay refused: {0}' -f $(if ($meaning) { $meaning } else { ($envRes.mailFromText + ' ' + $envRes.rcptToText).Trim() })) }
+    return (Set-StSectionTiming -Section (New-StSection -State $state -Reason $reason -Method 'Anonymous MAIL FROM / RCPT TO to an external recipient, reset before DATA' -Rows $rows -Data $data `
+            -Caveats @('Acceptance of the envelope is not delivery: Exchange Online can still quarantine or reject the message afterwards on content or sender reputation.', 'The connector configuration itself cannot be read from here; this tests whether it accepts THIS site, right now.')) -StartedUtc $t0 -DurationSec $sw.Elapsed.TotalSeconds)
+}
+
+function Invoke-StHttpProbe {
+    # One unauthenticated GET, headers only, redirects NOT followed. Built on
+    # the same TcpClient + SslStream path as the SMTP engine rather than
+    # HttpWebRequest, so the certificate can be captured and reported instead
+    # of the request simply failing - and so no validation callback ever has
+    # to run on a thread without a runspace.
+    param([string]$HostName, [string]$Path = '/autodiscover/autodiscover.xml', [bool]$Https = $true,
+          [int]$Port = 0, [int]$TimeoutMs = 8000)
+    if ($Port -le 0) { $Port = $(if ($Https) { 443 } else { 80 }) }
+    $out = [pscustomobject]@{
+        url = ('{0}://{1}{2}{3}' -f $(if ($Https) { 'https' } else { 'http' }), $HostName, $(if (($Https -and $Port -ne 443) -or (-not $Https -and $Port -ne 80)) { ':' + $Port } else { '' }), $Path)
+        connected = $false; status = 0; statusText = ''; location = ''; server = ''
+        authMethods = [object[]]@(); cert = $null; error = ''
+    }
+    $tcp = $null
+    try {
+        $tcp = New-Object System.Net.Sockets.TcpClient
+        $iar = $tcp.BeginConnect($HostName, $Port, $null, $null)
+        if (-not $iar.AsyncWaitHandle.WaitOne($TimeoutMs, $false) -or -not $tcp.Connected) { throw ('No connection to {0}:{1} within {2} ms.' -f $HostName, $Port, $TimeoutMs) }
+        $tcp.EndConnect($iar)
+        $out.connected = $true
+        $stream = $tcp.GetStream()
+        $stream.ReadTimeout = $TimeoutMs; $stream.WriteTimeout = $TimeoutMs
+
+        if ($Https) {
+            $captured = @{ Raw = $null; Errors = 'None' }
+            $validator = {
+                param($sender, $certificate, $chain, $sslPolicyErrors)
+                try { $captured.Errors = $sslPolicyErrors.ToString() } catch { }
+                try { if ($certificate) { $captured.Raw = $certificate.GetRawCertData() } } catch { }
+                return $true
+            }.GetNewClosure()
+            $ssl = New-Object System.Net.Security.SslStream($stream, $false, ([System.Net.Security.RemoteCertificateValidationCallback]$validator))
+            $ssl.ReadTimeout = $TimeoutMs; $ssl.WriteTimeout = $TimeoutMs
+            $ssl.AuthenticateAsClient($HostName, $null, (Get-StDefaultSslProtocols), $false)
+            $out.cert = Get-StCertificateFacts -RawCertData $captured.Raw -PolicyErrors $captured.Errors -ExpectedHost $HostName
+            $stream = $ssl
+        }
+
+        $req = ('GET {0} HTTP/1.1{1}Host: {2}{1}User-Agent: SMTP-Toolkit/{3}{1}Accept: */*{1}Connection: close{1}{1}' -f $Path, "`r`n", $HostName, (Get-StVersion))
+        $bytes = [Text.Encoding]::ASCII.GetBytes($req)
+        $stream.Write($bytes, 0, $bytes.Length); $stream.Flush()
+
+        # Headers only: read to the blank line and stop.
+        $buf = [System.Collections.Generic.List[byte]]::new()
+        while ($buf.Count -lt 65536) {
+            $b = $stream.ReadByte()
+            if ($b -lt 0) { break }
+            $buf.Add([byte]$b)
+            $n = $buf.Count
+            if ($n -ge 4 -and $buf[$n-4] -eq 13 -and $buf[$n-3] -eq 10 -and $buf[$n-2] -eq 13 -and $buf[$n-1] -eq 10) { break }
+        }
+        $head = [Text.Encoding]::ASCII.GetString($buf.ToArray())
+        $lines = @($head -split "`r`n")
+        if ($lines[0] -match '^HTTP/\d\.\d\s+(\d{3})\s*(.*)$') { $out.status = [int]$Matches[1]; $out.statusText = $Matches[2].Trim() }
+        $auth = @()
+        foreach ($l in $lines) {
+            if ($l -match '^(?i)Location:\s*(.+)$')         { $out.location = $Matches[1].Trim() }
+            elseif ($l -match '^(?i)Server:\s*(.+)$')       { $out.server = $Matches[1].Trim() }
+            elseif ($l -match '^(?i)WWW-Authenticate:\s*(\S+)') { $auth += $Matches[1].Trim() }
+        }
+        $out.authMethods = [object[]]@($auth | Select-Object -Unique)
+    } catch {
+        $out.error = $_.Exception.Message
+        if ($_.Exception.InnerException) { $out.error = ('{0} {1}' -f $out.error, $_.Exception.InnerException.Message) }
+    } finally {
+        if ($tcp) { try { $tcp.Close() } catch { } }
+    }
+    return $out
+}
+
+function Get-StAutodiscoverAnswer {
+    # Does this HTTP result count as "Autodiscover answered"? A 401 is the
+    # normal unauthenticated answer from Exchange; 200 and 405 also mean the
+    # service is there; a redirect counts only if it points at another
+    # Autodiscover URL. 404, 403 and a website's home page do not.
+    #
+    # A redirect is only an answer in two cases: the plain-HTTP step, which
+    # exists precisely to redirect (that is how Microsoft 365 vanity domains
+    # work), or a redirect straight into Microsoft's own service. A website
+    # bouncing https://domain to https://autodiscover.domain is just a pointer
+    # to a step that is tested separately - counting it would report success
+    # for a domain where nothing actually answers.
+    param($Probe, [bool]$Https = $true)
+    if (-not $Probe -or $Probe.status -eq 0) { return $false }
+    if ($Probe.status -eq 401 -or $Probe.status -eq 200 -or $Probe.status -eq 405) { return $true }
+    $isRedirect = ($Probe.status -eq 301 -or $Probe.status -eq 302 -or $Probe.status -eq 307 -or $Probe.status -eq 308)
+    if (-not $isRedirect -or $Probe.location -notmatch '(?i)autodiscover') { return $false }
+    $target = ''
+    try { $target = ([uri]$Probe.location).Host } catch { }
+    if ($target -match '(?i)\.outlook\.com$|\.office365\.com$') { return $true }
+    if (-not $Https -and $Probe.location -match '^(?i)https://') { return $true }
+    return $false
+}
+
+function Test-StAutodiscover {
+    # Quick answer to one question: does anything answer Autodiscover for this
+    # address, and where? Unauthenticated throughout - no password is sent, so
+    # there is nothing to lock out. It is the same set of requests Outlook
+    # makes when it starts, in roughly the same order.
+    param([string]$Email, [int]$TimeoutMs = 8000, $Shared = $null)
+    $t0 = (Get-Date).ToUniversalTime()
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+
+    if (-not (Test-StEmailAddress $Email)) { return (New-StSection -State 'skipped' -Reason 'Enter a From address - Autodiscover is looked up for that mailbox.') }
+    $domain = (Get-StDomainFromAddress $Email).ToLowerInvariant()
+    $adHost = ('autodiscover.{0}' -f $domain)
+    $rows = @()
+    $answeredBy = ''
+    $where = ''
+
+    # 1. Microsoft 365 knows where a mailbox lives, and says so without a
+    #    password. This is the one Outlook for Microsoft 365 trusts first.
+    if ($Shared) { $Shared.Status = 'Asking Microsoft 365 where the mailbox lives' }
+    $v2Url = ''
+    $v2Status = ''
+    try {
+        Set-StNetDefaults
+        $u = ('https://autodiscover-s.outlook.com/autodiscover/autodiscover.json/v1.0/{0}?Protocol=AutodiscoverV1' -f [uri]::EscapeDataString($Email))
+        $resp = Invoke-WebRequest -Uri $u -UseBasicParsing -TimeoutSec ([math]::Max(5, [int]($TimeoutMs / 1000))) -ErrorAction Stop
+        $j = $resp.Content | ConvertFrom-Json
+        $v2Url = [string]$j.Url
+        $v2Status = [string]$resp.StatusCode
+    } catch {
+        $v2Status = 'no answer'
+        try { if ($_.Exception.Response) { $v2Status = [string][int]$_.Exception.Response.StatusCode } } catch { }
+    }
+    if ($v2Url) {
+        $h = ''
+        try { $h = ([uri]$v2Url).Host } catch { }
+        if ($h -match '(?i)\.outlook\.com$|\.office365\.com$') {
+            $where = 'Exchange Online'
+            $rows += New-StRow -Group 'Autodiscover' -Check 'Microsoft 365 lookup' -Result 'Mailbox is in Exchange Online' -Basis 'server-reported' -Status 'ok' -Detail ('Microsoft returned {0}' -f $v2Url)
+        } else {
+            $where = ('on-premises ({0})' -f $h)
+            $rows += New-StRow -Group 'Autodiscover' -Check 'Microsoft 365 lookup' -Result ('Points to {0}' -f $h) -Basis 'server-reported' -Status 'info' `
+                -Detail ('Microsoft returned {0}. That is usually a hybrid organisation whose mailbox is still on-premises.' -f $v2Url)
+        }
+        $answeredBy = 'Microsoft 365 Autodiscover'
+    }
+    # The Microsoft 365 row is written after DNS, because what a miss means
+    # depends on where the domain's autodiscover record points.
+
+    # 2. DNS for the autodiscover host, through the public resolver.
+    if ($Shared) { $Shared.Status = ('Looking up {0}' -f $adHost) }
+    $cname = ''
+    $adIps = @()
+    try {
+        $rr = @(Invoke-StDnsQuery -Name $adHost -Type A -ErrorAction Stop)
+        $c = @($rr | Where-Object { $_.QueryType -eq 'CNAME' } | Select-Object -First 1)
+        if ($c.Count) { $cname = [string]$c[0].NameHost }
+        $adIps = @($rr | Where-Object { $_.QueryType -eq 'A' } | ForEach-Object { [string]$_.IPAddress })
+    } catch { }
+    $srvTarget = ''
+    try {
+        $s = @(Invoke-StDnsQuery -Name ('_autodiscover._tcp.{0}' -f $domain) -Type SRV -ErrorAction Stop | Where-Object { $_.QueryType -eq 'SRV' } | Select-Object -First 1)
+        if ($s.Count) { $srvTarget = ('{0}:{1}' -f $s[0].NameTarget, $s[0].Port) }
+    } catch { }
+    $cnameToMs = ($cname -match '(?i)outlook\.com\.?$')
+    if ($cname -or $adIps.Count) {
+        $rows += New-StRow -Group 'Autodiscover' -Check ('DNS {0}' -f $adHost) -Result $(if ($cname) { ('CNAME {0}' -f $cname.TrimEnd('.')) } else { ($adIps -join ', ') }) -Basis 'server-reported' -Status 'ok' `
+            -Detail $(if ($cnameToMs) { 'Points at Microsoft 365, as it should for mailboxes in Exchange Online.' } else { '' })
+    } else {
+        $rows += New-StRow -Group 'Autodiscover' -Check ('DNS {0}' -f $adHost) -Result 'No record' -Basis 'server-reported' -Status 'info' `
+            -Detail 'Outlook falls back to the other methods. For Exchange Online, Microsoft recommends a CNAME to autodiscover.outlook.com.'
+    }
+    if ($srvTarget) { $rows += New-StRow -Group 'Autodiscover' -Check 'DNS SRV _autodiscover._tcp' -Result $srvTarget -Basis 'server-reported' -Status 'info' }
+    if (-not $v2Url) {
+        if ($cnameToMs) {
+            $rows = @((New-StRow -Group 'Autodiscover' -Check 'Microsoft 365 lookup' -Result ('Microsoft 365 does not know this address ({0})' -f $v2Status) -Basis 'server-reported' -Status 'warn' `
+                -Detail ('The domain''s autodiscover record points at Microsoft 365, so the domain is there - but this particular mailbox is not. Check the spelling of {0}, or whether it is an alias rather than a mailbox.' -f $Email))) + $rows
+        } else {
+            $rows = @((New-StRow -Group 'Autodiscover' -Check 'Microsoft 365 lookup' -Result ('Not known to Microsoft 365 ({0})' -f $v2Status) -Basis 'server-reported' -Status 'info' `
+                -Detail 'Normal for an on-premises-only Exchange organisation. The checks below look for the on-premises service.')) + $rows
+        }
+    }
+
+    # 3. The HTTP endpoints, in the order Outlook tries them. The bare domain
+    #    usually lands on the company website: a certificate there that does
+    #    not match is the classic cause of an Outlook security prompt at every
+    #    start-up, so it is worth flagging even when a later step answers.
+    $probes = @(
+        @{ label = ('https://{0}' -f $domain); host = $domain; https = $true }
+        @{ label = ('https://{0}' -f $adHost); host = $adHost; https = $true }
+        @{ label = ('http://{0} (redirect)' -f $adHost); host = $adHost; https = $false }
+    )
+    $promptRisk = $false
+    foreach ($p in $probes) {
+        if ($Shared) { $Shared.Status = ('Trying {0}' -f $p.label) }
+        $r = Invoke-StHttpProbe -HostName $p.host -Https $p.https -TimeoutMs $TimeoutMs
+        $ok = Get-StAutodiscoverAnswer -Probe $r -Https $p.https
+        if (-not $r.connected) {
+            $nd = $r.error
+            if ($p.https -and $p.host -eq $adHost -and $cnameToMs) { $nd = ('{0}  Expected with a CNAME to Microsoft 365: Microsoft does not serve HTTPS for customer host names here, so Outlook uses the redirect or the Microsoft 365 lookup.' -f $r.error) }
+            $rows += New-StRow -Group 'Autodiscover' -Check $p.label -Result 'No connection' -Status 'info' -Detail $nd
+            continue
+        }
+        $res = if ($r.status) { ('HTTP {0} {1}' -f $r.status, $r.statusText).Trim() } else { 'No HTTP reply' }
+        $detail = @()
+        if ($r.location) { $detail += ('Redirects to {0}' -f $r.location) }
+        if (@($r.authMethods).Count) { $detail += ('Login methods offered: {0}' -f (@($r.authMethods) -join ', ')) }
+        if ($r.error) { $detail += $r.error }
+        $status = if ($ok) { 'ok' } else { 'info' }
+
+        if ($p.https -and $r.cert -and $r.cert.present -and -not $r.cert.hostNameMatches) {
+            if ($p.host -eq $adHost -and $cnameToMs) {
+                $detail += 'Certificate is Microsoft''s, not this domain''s - expected with a CNAME to Microsoft 365. Outlook uses the redirect or the Microsoft 365 lookup instead.'
+            } else {
+                $promptRisk = $true
+                $status = 'warn'
+                $detail += ('The certificate here does not cover {0} ({1}). Outlook tries this address and shows a certificate warning when it does - the classic "security alert at every start-up".' -f $p.host, $r.cert.subject)
+            }
+        }
+        if (@($r.authMethods) -contains 'Basic' -and $ok) {
+            $status = 'warn'
+            $detail += 'Basic authentication is still offered on an internet-facing endpoint.'
+        }
+        $rows += New-StRow -Group 'Autodiscover' -Check $p.label -Result $(if ($ok) { ('ANSWERS - {0}' -f $res) } else { $res }) -Basis 'measured' -Status $status -Detail ($detail -join '  ')
+        if ($ok -and -not $answeredBy) {
+            $answeredBy = $p.label
+            if (-not $where) {
+                $where = $p.host
+                if ($r.location) {
+                    $lh = ''
+                    try { $lh = ([uri]$r.location).Host } catch { }
+                    if ($lh -match '(?i)\.outlook\.com$|\.office365\.com$') { $where = 'Exchange Online' } elseif ($lh) { $where = $lh }
+                }
+            }
+        }
+    }
+
+    if ($answeredBy) {
+        $rows += New-StRow -Group 'Autodiscover' -Check 'Outcome' -Result ('Answers via {0}' -f $answeredBy) -Basis 'inference' -Status $(if ($promptRisk) { 'warn' } else { 'ok' }) `
+            -Detail $(if ($where -and $v2Url) { ('Mailbox location: {0}.' -f $where) } elseif ($where) { ('Autodiscover service: {0}. That says where the domain is served, not that this mailbox exists.' -f $where) } else { '' })
+    } else {
+        $rows += New-StRow -Group 'Autodiscover' -Check 'Outcome' -Result 'Nothing answers Autodiscover for this address' -Basis 'inference' -Status 'fail' `
+            -Detail 'Outlook will not be able to set this mailbox up automatically. Add the autodiscover DNS record for the domain, or check the address is right.'
+    }
+
+    $sw.Stop()
+    $data = [pscustomobject]@{
+        email = $Email; domain = $domain; answered = [bool]$answeredBy; answeredBy = $answeredBy
+        mailboxLocation = $where; microsoftUrl = $v2Url; cname = $cname; srv = $srvTarget; certificatePromptRisk = $promptRisk
+    }
+    $state = if ($answeredBy) { 'measured' } else { 'failed' }
+    return (Set-StSectionTiming -Section (New-StSection -State $state -Reason $(if ($answeredBy) { '' } else { 'Nothing answered Autodiscover for this address.' }) `
+            -Method 'Unauthenticated requests only, in the order Outlook makes them. The address is sent to Microsoft''s public Autodiscover service, as Outlook does.' -Rows $rows -Data $data) -StartedUtc $t0 -DurationSec $sw.Elapsed.TotalSeconds)
 }
 
 function Test-StRawSend {
@@ -1805,7 +2367,7 @@ function Test-StRawSend {
         [string]$Server, [int]$Port, [string]$Security, [string]$HeloName,
         [string]$Username, [string]$Password, [string]$From, [string]$To,
         [string]$Subject = '', [string]$Body = '',
-        $Sink = $null, [int]$IoTimeoutMs = 30000
+        $Sink = $null, [int]$IoTimeoutMs = 30000, [string]$Kind = 'generic'
     )
     $t0 = (Get-Date).ToUniversalTime()
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
@@ -1853,7 +2415,8 @@ function Test-StRawSend {
             $rows += New-StRow -Group 'Live send' -Check 'Message-ID' -Result $res.messageId -Status 'info' `
                 -Detail 'Quote this when asking the provider to trace the message through their logs.'
         } else {
-            $rows += New-StRow -Group 'Live send' -Check ('Delivery on port {0} ({1})' -f $Port, $sec) -Result ('FAILED at {0} ({1})' -f $res.stage, $res.code) -Status 'fail' -Detail $res.text
+            $sendMeaning = Get-StReplyMeaning -Code $res.code -Text $res.text -Kind $Kind -HasCredentials ((-not [string]::IsNullOrEmpty($Username)) -or (-not [string]::IsNullOrEmpty($Password)))
+            $rows += New-StRow -Group 'Live send' -Check ('Delivery on port {0} ({1})' -f $Port, $sec) -Result ('FAILED at {0} ({1})' -f $res.stage, $res.code) -Status 'fail' -Detail (('{0}  {1}' -f $res.text, $sendMeaning).Trim())
         }
     } catch {
         $rows += New-StRow -Group 'Live send' -Check 'Session' -Result 'FAILED' -Status 'fail' -Detail $_.Exception.Message
@@ -1895,14 +2458,23 @@ function Invoke-StSmtpClientProbe {
     param(
         [string]$Server, [int]$Port, [bool]$EnableSsl,
         [string]$Username, [string]$Password, [string]$From, [string]$To,
-        [string]$HeloName, [int]$TimeoutMs = 20000, $Sink = $null
+        [string]$HeloName, [int]$TimeoutMs = 20000, $Sink = $null,
+        [string]$Kind = 'generic',
+        # Set by the matrix once a login has been rejected: the transport is
+        # still measured, the password is not tried again.
+        [bool]$SkipAuth = $false
     )
+    $hasCreds = (-not [string]::IsNullOrEmpty($Username)) -or (-not [string]::IsNullOrEmpty($Password))
     $out = [pscustomobject]@{
         port = $Port; enableSsl = $EnableSsl; ok = $false
         stage = 'tcp'; failure = ''; elapsedMs = 0; encrypted = $false
         wouldSend = $false; diagnosis = ''
         authTested = $false          # were credentials actually exercised here
         credentialsInClear = $false  # ... and did they cross unencrypted
+        authRejected = $false        # the server said no to the password
+        authSkipped = ''             # why the login was deliberately not tried
+        credentialsIgnored = $false  # no AUTH offered, so SmtpClient sends without
+        clientWouldUse = ''          # GSSAPI / NTLM, which the real class prefers
     }
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
     $conn = $null
@@ -1932,7 +2504,23 @@ function Invoke-StSmtpClientProbe {
             $ehlo = Invoke-StEhlo -Conn $conn -HeloName $HeloName
         }
 
-        if (-not [string]::IsNullOrEmpty($Username) -or -not [string]::IsNullOrEmpty($Password)) {
+        $offered = @($ehlo.authMechs)
+        $winMech = @($offered | Where-Object { $_ -eq 'GSSAPI' -or $_ -eq 'NTLM' })
+        if ($winMech.Count -gt 0) { $out.clientWouldUse = $winMech[0] }
+
+        if ($hasCreds -and $offered.Count -eq 0) {
+            # Measured against the real class: with credentials set and no AUTH
+            # offered, SmtpClient skips the login and sends anyway. Replaying
+            # that is what lets this probe answer "will an app that insists on
+            # a password work through an IP connector" - it will.
+            $out.credentialsIgnored = $true
+        } elseif ($hasCreds -and $SkipAuth) {
+            $out.stage = 'auth'
+            $out.authSkipped = 'protecting the account after a rejected password'
+            $out.failure = 'Login not attempted - an earlier combination already had this password rejected.'
+            $out.diagnosis = 'The transport on this port and SSL setting reached the login step. The password was not tried again, so the account is not pushed towards lockout.'
+            return $out
+        } elseif ($hasCreds) {
             $out.stage = 'auth'
             $out.authTested = $true
             # SMTP2GO - and Exim generally - advertises AUTH on the plaintext
@@ -1944,8 +2532,9 @@ function Invoke-StSmtpClientProbe {
             $a = Invoke-StAuthenticate -Conn $conn -Username $Username -Password $Password
             if (-not $a.success) {
                 $out.failure = ('AUTH rejected ({0}): {1}' -f $a.code, $a.text)
+                $out.authRejected = ($a.code -eq 535 -or $a.text -match '\b5\.7\.(3|8|139)\b')
+                $out.diagnosis = Get-StReplyMeaning -Code $a.code -Text $a.text -Kind $Kind -HasCredentials $true
                 if ($a.code -eq 530) { $out.diagnosis = 'The server refuses authentication on an unencrypted channel. The application''s SSL setting has to be on for this port.' }
-                elseif ($a.code -eq 535) { $out.diagnosis = 'The credentials are wrong for this server.' }
                 return $out
             }
         }
@@ -1955,6 +2544,8 @@ function Invoke-StSmtpClientProbe {
             $envRes = Invoke-StEnvelope -Conn $conn -From $From -To $To
             if (-not $envRes.success) {
                 $out.failure = ('Envelope refused - MAIL FROM {0}, RCPT TO {1}: {2}' -f $envRes.mailFromCode, $envRes.rcptToCode, ($envRes.mailFromText + ' ' + $envRes.rcptToText).Trim())
+                if ($envRes.mailFromCode -ne 250) { $out.diagnosis = Get-StReplyMeaning -Code $envRes.mailFromCode -Text $envRes.mailFromText -Kind $Kind -HasCredentials ($hasCreds -and -not $out.credentialsIgnored) }
+                else { $out.diagnosis = Get-StReplyMeaning -Code $envRes.rcptToCode -Text $envRes.rcptToText -Kind $Kind -HasCredentials ($hasCreds -and -not $out.credentialsIgnored) }
                 return $out
             }
             $out.wouldSend = $true
@@ -1963,6 +2554,9 @@ function Invoke-StSmtpClientProbe {
         $out.stage = 'complete'
         $out.ok = $true
         $out.diagnosis = 'This combination works. An application using System.Net.Mail.SmtpClient can send with these settings.'
+        if ($out.credentialsIgnored) {
+            $out.diagnosis = 'This combination works. The server offers no login, so the application''s username and password are simply not used - System.Net.Mail.SmtpClient skips AUTH in that case. The connection itself is what is authorised.'
+        }
     } catch {
         $msg = $_.Exception.Message
         $out.failure = $msg
@@ -1986,10 +2580,12 @@ function Test-StDotNetSmtpClient {
     param(
         [string]$Server, [int]$Port, [bool]$EnableSsl,
         [string]$Username, [string]$Password, [string]$From, [string]$To,
-        [int]$TimeoutMs = 20000, $Sink = $null
+        [int]$TimeoutMs = 20000, $Sink = $null, [string]$Kind = 'generic'
     )
     $t0 = (Get-Date).ToUniversalTime()
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $hasCreds = (-not [string]::IsNullOrEmpty($Username)) -or (-not [string]::IsNullOrEmpty($Password))
+    $authRejectedLikely = $false
 
     if (-not (Test-StEmailAddress $From)) { return (New-StSection -State 'skipped' -Reason 'A valid From address is required - SmtpClient will not send without one.') }
     if (-not (Test-StEmailAddress $To))   { return (New-StSection -State 'skipped' -Reason 'A valid To address is required.') }
@@ -2059,6 +2655,22 @@ function Test-StDotNetSmtpClient {
             $detail = ('{0}{1}{1}This is the documented incompatibility, not a network fault. Port {2} requires implicit SSL - the TLS handshake happens before any SMTP command. SmtpClient only implements STARTTLS, so it connects and waits for a plaintext greeting that never arrives. Microsoft state that the implicit-SSL connection method is not supported by this class.' -f $errMsg, [Environment]::NewLine, $Port)
         } elseif ($errMsg -match '(?i)does not support secure') {
             $detail = ('{0}{1}{1}The server did not offer STARTTLS on this port. Either untick SSL for this port or move to a port that offers it.' -f $errMsg, [Environment]::NewLine)
+        } elseif ($hasCreds -and ($errMsg -match '(?i)\b5\.7\.57\b|not authenticated|5\.7\.3\b|5\.7\.8\b|5\.7\.139')) {
+            # The misleading one. Measured: after a rejected login SmtpClient
+            # carries on to MAIL FROM, the server refuses the unauthenticated
+            # sender, and the exception reads "requires a secure connection or
+            # the client was not authenticated" with status MustIssueStartTlsFirst.
+            # It is a password fault dressed as a TLS fault.
+            $authRejectedLikely = $true
+            $code = 530
+            if ($errMsg -match '\b5\.7\.139\b') { $code = 535 }
+            $detail = ('{0}{1}{1}{2}' -f $errMsg, [Environment]::NewLine, (Get-StReplyMeaning -Code $code -Text $errMsg -Kind $Kind -HasCredentials $true))
+        } else {
+            $m = [regex]::Match($errMsg, '\b([245])(\d\d)\b')
+            $basic = 0
+            if ($m.Success) { $basic = [int]($m.Groups[1].Value + $m.Groups[2].Value) }
+            $mean = Get-StReplyMeaning -Code $basic -Text $errMsg -Kind $Kind -HasCredentials $hasCreds
+            if ($mean) { $detail = ('{0}{1}{1}{2}' -f $errMsg, [Environment]::NewLine, $mean) }
         }
         $rows += New-StRow -Group 'Application emulation' -Check ('Port {0}, SSL {1}' -f $Port, $sslLabel) -Result ('FAILED after {0:N1} s' -f $sw.Elapsed.TotalSeconds) -Status 'fail' -Detail $detail
         if ($statusCode) { $rows += New-StRow -Group 'Application emulation' -Check 'SMTP status code' -Result $statusCode -Basis 'server-reported' -Status 'info' }
@@ -2068,6 +2680,7 @@ function Test-StDotNetSmtpClient {
         port = $Port; enableSsl = $EnableSsl; timeoutMs = $TimeoutMs
         sent = $ok; errorType = $errType; error = $errMsg; statusCode = $statusCode
         elapsedSec = [math]::Round($sw.Elapsed.TotalSeconds, 2)
+        authRejectedLikely = $authRejectedLikely
     }
     $state = if ($ok) { 'measured' } else { 'failed' }
     $reason = if ($ok) { '' } else { ('SmtpClient could not send: {0}' -f $errMsg) }
@@ -2082,7 +2695,7 @@ function Invoke-StAppMatrix {
         [string]$Server, [int[]]$Ports, [string]$Username, [string]$Password,
         [string]$From, [string]$To, [string]$HeloName,
         [int]$TimeoutMs = 15000, [bool]$LiveSend = $false,
-        $Sink = $null, $Shared = $null
+        $Sink = $null, $Shared = $null, [string]$Kind = 'generic'
     )
     $t0 = (Get-Date).ToUniversalTime()
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
@@ -2091,6 +2704,13 @@ function Invoke-StAppMatrix {
     $cells = @()
     $total = ($Ports.Count * 2)
     $done = 0
+    # Lockout guard. Against Active Directory every rejected login counts, and
+    # the real SmtpClient makes TWO attempts per send when NTLM or GSSAPI is
+    # offered. A mistyped password tried in every cell of a four-port matrix
+    # could lock the user out in the middle of the diagnosis. So the password
+    # is tried until it is rejected once, and never again in this run.
+    $authRejected = $false
+    $guardCell = $null
 
     foreach ($p in $Ports) {
         foreach ($ssl in @($true, $false)) {
@@ -2101,23 +2721,42 @@ function Invoke-StAppMatrix {
                 $Shared.Progress = [int](($done / [math]::Max($total,1)) * 100)
             }
 
-            if ($LiveSend) {
+            if ($LiveSend -and $authRejected) {
+                # The real class cannot be told "transport only", so once the
+                # password has been refused the remaining live sends are skipped
+                # outright rather than spending two more failed logins each.
+                $cell = [pscustomobject]@{
+                    port = $p; enableSsl = $ssl; ok = $false; mode = 'live'
+                    stage = 'auth'; failure = 'Not sent - an earlier combination already had this password rejected.'
+                    elapsedMs = 0; diagnosis = 'Skipped to protect the account from lockout.'
+                    authRejected = $false; authSkipped = 'protecting the account after a rejected password'
+                    credentialsIgnored = $false; clientWouldUse = ''; authTested = $false; credentialsInClear = $false
+                }
+            } elseif ($LiveSend) {
                 $sec = Test-StDotNetSmtpClient -Server $Server -Port $p -EnableSsl $ssl -Username $Username -Password $Password `
-                                               -From $From -To $To -TimeoutMs $TimeoutMs -Sink $Sink
+                                               -From $From -To $To -TimeoutMs $TimeoutMs -Sink $Sink -Kind $Kind
                 $cellOk = ($sec.state -eq 'measured')
+                $rej = [bool]($sec.data -and $sec.data.authRejectedLikely)
                 $cell = [pscustomobject]@{
                     port = $p; enableSsl = $ssl; ok = $cellOk; mode = 'live'
-                    stage = $(if ($cellOk) { 'sent' } else { 'failed' })
+                    stage = $(if ($cellOk) { 'sent' } elseif ($rej) { 'auth' } else { 'failed' })
                     failure = $(if ($cellOk) { '' } else { $sec.reason })
                     elapsedMs = [int]($sec.durationSec * 1000)
-                    diagnosis = ''
+                    diagnosis = $(if ($rej) { 'The password was rejected. SmtpClient reports this as "requires a secure connection or the client was not authenticated".' } else { '' })
+                    authRejected = $rej; authSkipped = ''; credentialsIgnored = $false; clientWouldUse = ''
+                    authTested = $true; credentialsInClear = (-not $ssl)
                 }
             } else {
                 $cell = Invoke-StSmtpClientProbe -Server $Server -Port $p -EnableSsl $ssl -Username $Username -Password $Password `
-                                                 -From $From -To $To -HeloName $HeloName -TimeoutMs $TimeoutMs -Sink $Sink
+                                                 -From $From -To $To -HeloName $HeloName -TimeoutMs $TimeoutMs -Sink $Sink `
+                                                 -Kind $Kind -SkipAuth $authRejected
                 $cell | Add-Member -NotePropertyName 'mode' -NotePropertyValue 'probe' -Force
             }
             $cells += $cell
+            if ($cell.authRejected -and -not $authRejected) {
+                $authRejected = $true
+                $guardCell = $cell
+            }
 
             $sslLabel = if ($ssl) { 'ticked' } else { 'unticked' }
             if ($cell.ok) {
@@ -2140,8 +2779,15 @@ function Invoke-StAppMatrix {
                         $detail = 'Works, but with no encryption. Use the SSL-ticked row on the same port instead.'
                     }
                 }
+                if ($cell.PSObject.Properties['clientWouldUse'] -and $cell.clientWouldUse) {
+                    $detail = ('{0}  The server offers {1}: the real application will try {1} before LOGIN, which this probe does not replay - confirm with Reproduce app send.' -f $detail, $cell.clientWouldUse).Trim()
+                    if ($status -eq 'ok') { $status = 'warn' }
+                }
                 $rows += New-StRow -Group 'Settings matrix' -Check ('Port {0}, SSL {1}' -f $p, $sslLabel) `
                     -Result $result -Status $status -Detail $detail
+            } elseif ($cell.PSObject.Properties['authSkipped'] -and $cell.authSkipped) {
+                $rows += New-StRow -Group 'Settings matrix' -Check ('Port {0}, SSL {1}' -f $p, $sslLabel) `
+                    -Result 'reached the login - password not retried' -Basis 'not measured' -Status 'info' -Detail $cell.diagnosis
             } else {
                 $failDetail = $(if ($cell.diagnosis) { ('{0}  [{1}]' -f $cell.diagnosis, $cell.failure) } else { $cell.failure })
                 # A rejected login still travelled. Someone testing with the
@@ -2159,6 +2805,10 @@ function Invoke-StAppMatrix {
     }
 
     $sw.Stop()
+    if ($guardCell) {
+        $rows += New-StRow -Group 'Settings matrix' -Check 'Lockout guard' -Result ('Password tried once, rejected on port {0}' -f $guardCell.port) -Basis 'measured' -Status 'warn' `
+            -Detail 'After the first rejection the password was not tried again in this run, so an Active Directory account is not pushed towards its lockout threshold. Later combinations still measured everything up to the login. Fix the password, then run the matrix again.'
+    }
     $working = @($cells | Where-Object { $_.ok })
     $secure  = @($working | Where-Object { $_.enableSsl })
     $state = 'measured'
@@ -2172,6 +2822,8 @@ function Invoke-StAppMatrix {
         workingCount = $working.Count
         secureWorkingCount = $secure.Count
         credentialsTested = [bool]((-not [string]::IsNullOrEmpty($Username)) -or (-not [string]::IsNullOrEmpty($Password)))
+        lockoutGuardTripped = [bool]$guardCell
+        loginAttempts = @($cells | Where-Object { $_.authTested }).Count
     }
     $method = if ($LiveSend) {
         'Real System.Net.Mail.SmtpClient sends, one per combination'
@@ -2589,7 +3241,7 @@ function Get-StRecommendation {
 }
 
 function Get-StVerdict {
-    param($Sections, [string]$Server, [string]$AppProfileName = '')
+    param($Sections, [string]$Server, [string]$AppProfileName = '', [string]$Kind = 'generic')
 
     $subs = @()
 
@@ -2642,6 +3294,11 @@ function Get-StVerdict {
             $subs += New-StSubscore -Name 'Certificate' -Level 'amber' -Summary ('the certificate is issued by "{0}", not a public CA' -f $c.issuerCn) -Remedy 'Something local is inspecting TLS. Exclude the mail server from that product and re-test.'
         } elseif ($null -ne $c.daysUntilExpiry -and $c.daysUntilExpiry -lt 14) {
             $subs += New-StSubscore -Name 'Certificate' -Level 'amber' -Summary ('the server certificate expires in {0} days' -f $c.daysUntilExpiry)
+        } elseif ($c.selfSigned -or -not $c.issuerLooksPublic) {
+            # Only reachable when interception was NOT suspected, i.e. the
+            # server kind expects an internal CA and this machine trusts it.
+            $subs += New-StSubscore -Name 'Certificate' -Level 'green' -Summary ('valid and trusted here - issued by internal CA "{0}", normal for on-prem Exchange' -f $c.issuerCn) `
+                -Remedy 'Any other machine that sends through this server must trust the same CA.'
         } else {
             $subs += New-StSubscore -Name 'Certificate' -Level 'green' -Summary 'valid, matching, publicly issued'
         }
@@ -2654,7 +3311,14 @@ function Get-StVerdict {
     if ($auth -and $auth.state -eq 'measured' -and $auth.data -and $auth.data.accepted) {
         $subs += New-StSubscore -Name 'Authentication' -Level 'green' -Summary ('the credentials are accepted (AUTH {0})' -f $auth.data.mechanismUsed)
     } elseif ($auth -and $auth.state -eq 'failed') {
-        $subs += New-StSubscore -Name 'Authentication' -Level 'red' -Summary 'the server rejected the credentials' -Remedy $auth.reason
+        $authRemedy = $auth.reason
+        if ($auth.data -and $auth.data.code) {
+            $am = Get-StReplyMeaning -Code ([int]$auth.data.code) -Text ([string]$auth.data.text) -Kind $Kind -HasCredentials $true
+            if ($am) { $authRemedy = $am }
+        }
+        $authSum = 'the server rejected the credentials'
+        if ($auth.data -and [string]$auth.data.text -match '\b5\.7\.139\b') { $authSum = 'Exchange Online refused basic authentication (5.7.139)' }
+        $subs += New-StSubscore -Name 'Authentication' -Level 'red' -Summary $authSum -Remedy $authRemedy
     } else {
         $subs += New-StSubscore -Name 'Authentication' -Level 'notmeasured' -Summary 'no credentials were tested'
     }
@@ -2741,6 +3405,52 @@ function Get-StVerdict {
         $subs += New-StSubscore -Name 'Application compatibility' -Level 'notmeasured' -Summary 'the application emulation did not run'
     }
 
+    # --- Relay / connector: anonymous relay to an outside recipient. The
+    # deciding test for the Exchange Online connector route, and a useful one
+    # for on-prem anonymous relay; for a hosted relay with SMTP AUTH it only
+    # appears when someone asked for it.
+    $rel = $Sections['relay']
+    $relayRelevant = ($Kind -eq 'exo-connector' -or $Kind -eq 'exchange-onprem' -or ($rel -and $rel.state -ne 'skipped'))
+    if ($relayRelevant) {
+        $routeName = if ($Kind -eq 'exo-connector') { 'Connector' } else { 'Anonymous relay' }
+        if ($rel -and $rel.state -eq 'measured' -and $rel.data -and $rel.data.accepted) {
+            $who = if ($rel.data.seenIp) { $rel.data.seenIp } else { 'this site' }
+            $subs += New-StSubscore -Name $routeName -Level 'green' -Summary ('accepts {0} for outside recipients, no credentials needed' -f $who)
+        } elseif ($rel -and $rel.state -eq 'failed' -and $rel.data) {
+            $d = $rel.data
+            if ($d.PSObject.Properties['portOpen'] -and -not $d.portOpen) {
+                $subs += New-StSubscore -Name $routeName -Level 'red' -Summary ('outbound port {0} is blocked from this site' -f $d.port) -Remedy 'Usually the ISP. Ask for port 25 to be opened to the mail host, or use an authenticated route on 587 instead.'
+            } elseif ($d.internalRecipient) {
+                $subs += New-StSubscore -Name $routeName -Level 'notmeasured' -Summary 'only an internal recipient was tried, which proves nothing about a connector'
+            } elseif ($d.PSObject.Properties['ipMatchesExpected'] -and $d.ipMatchesExpected -eq $false) {
+                $subs += New-StSubscore -Name $routeName -Level 'amber' `
+                    -Summary ('the connector is set for {0}, but this site arrives as {1}' -f (@($d.expectedIps) -join ', '), $d.seenIp) `
+                    -Remedy ('Add {0} to the connector.' -f $d.seenIp)
+            } elseif ([string]$d.meaning -match '(?i)block list') {
+                $subs += New-StSubscore -Name $routeName -Level 'red' -Summary 'this site''s IP address is on a block list' -Remedy $d.meaning
+            } else {
+                $lvl = if ($Kind -eq 'exo-connector') { 'red' } else { 'amber' }
+                $who = if ($d.seenIp) { $d.seenIp } else { 'this site' }
+                $rem = if ($d.meaning) { $d.meaning } else { $rel.reason }
+                $subs += New-StSubscore -Name $routeName -Level $lvl -Summary ('refuses to relay for {0}' -f $who) -Remedy $rem
+            }
+        } else {
+            $subs += New-StSubscore -Name $routeName -Level 'notmeasured' -Summary 'the relay test did not run - enter an external recipient on the Relay tab'
+        }
+    }
+
+    # --- Autodiscover: only when someone pressed the button.
+    $ad = $Sections['autodiscover']
+    if ($ad -and $ad.state -ne 'skipped' -and $ad.data) {
+        if ($ad.data.answered -and $ad.data.certificatePromptRisk) {
+            $subs += New-StSubscore -Name 'Autodiscover' -Level 'amber' -Summary ('answers ({0}), but a certificate mismatch will prompt in Outlook' -f $ad.data.answeredBy) -Remedy 'See the Autodiscover rows: the bare domain presents a certificate that does not cover it.'
+        } elseif ($ad.data.answered) {
+            $subs += New-StSubscore -Name 'Autodiscover' -Level 'green' -Summary ('answers via {0}' -f $ad.data.answeredBy)
+        } else {
+            $subs += New-StSubscore -Name 'Autodiscover' -Level 'red' -Summary ('nothing answers Autodiscover for {0}' -f $ad.data.email) -Remedy 'Add the autodiscover DNS record for the domain.'
+        }
+    }
+
     # --- Environment
     $crypto = $Sections['crypto']
     if ($crypto -and $crypto.state -eq 'measured') {
@@ -2759,6 +3469,22 @@ function Get-StVerdict {
 
     $health = Get-StHealth -Subscores $subs
     $rec = Get-StRecommendation -Sections $Sections -Server $Server -AppProfileName $AppProfileName
+
+    # The connector route has its own recommendation: no credentials, port 25,
+    # and SSL only if the server offered STARTTLS. It wins whenever it was
+    # proven, because it is the thing that was being tested.
+    if ($Kind -eq 'exo-connector' -and $rel -and $rel.state -eq 'measured' -and $rel.data -and $rel.data.accepted) {
+        $d = $rel.data
+        $rec.available  = $true
+        $rec.server     = $d.server
+        $rec.port       = $d.port
+        $rec.useSsl     = [bool]$d.tlsUsed
+        $rec.security   = $(if ($d.tlsUsed) { 'STARTTLS' } else { 'none' })
+        $rec.confidence = 'proven to the point of handing over the message body, with no credentials'
+        $rec.statement  = ('Set the application to {0}, port {1}, with its SSL / TLS option {2}, and NO username or password. The inbound connector authorises this site by its IP address ({3}).' -f $d.server, $d.port, $(if ($d.tlsUsed) { 'TICKED' } else { 'UNTICKED' }), $(if ($d.seenIp) { $d.seenIp } else { 'as seen by the server' }))
+        $rec.statement  = ('{0} If the application refuses to save without credentials, any value will do: the server offers no login, and System.Net.Mail.SmtpClient skips AUTH when none is offered (measured).' -f $rec.statement)
+        $rec.alternatives = [object[]]@()
+    }
 
     # A working recommendation is the most useful sentence in the report, so it
     # replaces the generic headline whenever the overall verdict is not red.
@@ -2810,9 +3536,13 @@ function New-StReport {
 function New-StTarget {
     param(
         [string]$Server, [int]$Port, [string]$Security, [string]$From, [string]$To,
-        [string]$Username, [string]$HeloName, [int[]]$Ports, [int]$TimeoutMs
+        [string]$Username, [string]$HeloName, [int[]]$Ports, [int]$TimeoutMs,
+        [string]$Kind = 'generic', [string]$ExternalTo = '', [string[]]$ConnectorIps = @()
     )
     [pscustomobject]@{
+        kind            = $Kind
+        externalTo      = $ExternalTo
+        connectorIps    = [object[]]$ConnectorIps
         server          = $Server
         port            = $Port
         security        = $Security
@@ -3052,9 +3782,64 @@ $WorkerScript = {
     $to       = [string]$Opt.To
     $ioMs     = [int]$Opt.TimeoutMs
     $ports    = @($Opt.Ports)
+    $kind     = [string]$Opt.ServerKind
+    if (-not $kind) { $kind = 'generic' }
+    $expectCa = [bool]$Opt.ExpectInternalCa
+    $extTo    = [string]$Opt.ExternalTo
+    $connIps  = @($Opt.ConnectorIps)
+
+    # Where the relay test points. The Exchange Online connector route is port
+    # 25 by definition; on-prem anonymous relay is normally 25 too.
+    $relayPort = $port
+    if ($kind -ne 'exo-connector' -and ($ports -contains 25)) { $relayPort = 25 }
+
+    function Invoke-Relay {
+        param([bool]$PortOpen = $true)
+        $pubIp = ''
+        $pubSec = $Shared.Sections['publicIp']
+        if ($pubSec -and $pubSec.data) { $pubIp = [string]$pubSec.data.publicIp }
+        $Shared.Status = ('Relay test on port {0} (no credentials, nothing is delivered)' -f $relayPort)
+        $rel = Test-StRelay -Server $server -Port $relayPort -HeloName $helo -From $from -ExternalTo $extTo `
+                            -ExpectedIps $connIps -PublicIp $pubIp -Kind $kind -PortOpen $PortOpen -Sink $sink -IoTimeoutMs $ioMs
+        Publish 'relay' $rel
+        if ($rel.data -and $rel.data.accepted) { Log ('Relay accepted: {0} lets this site send to outside recipients without credentials.' -f $server) }
+        elseif ($rel.state -ne 'skipped') { Log ('Relay refused: {0}' -f $rel.reason) }
+    }
 
     try {
         Set-StNetDefaults
+
+        # Exchange Online connector route: the host is the tenant MX, taken
+        # from the From domain using a public resolver so an AD-integrated
+        # zone inside the network cannot hand back an empty answer.
+        if ($kind -eq 'exo-connector') {
+            $Shared.Status = 'Looking up the From domain''s MX'
+            $dom = Get-StDomainFromAddress $from
+            $mxInfo = Resolve-StMx -Domain $dom
+            $mxRows = @()
+            if ($mxInfo.best) {
+                $mxRows += New-StRow -Group 'MX' -Check ('MX for {0}' -f $dom) -Result ($(if (@($mxInfo.publicMx).Count) { @($mxInfo.publicMx) } else { @($mxInfo.localMx) }) -join ', ') -Basis 'server-reported' -Status $(if ($mxInfo.isExchangeOnline) { 'ok' } else { 'warn' }) `
+                    -Detail $(if ($mxInfo.isExchangeOnline) { 'Hosted in Exchange Online. The connector route sends to this host on port 25.' } else { 'This MX is not an Exchange Online host (*.mail.protection.outlook.com). Either mail for this domain is filtered by a third party first, or it is not hosted in Exchange Online - in which case an Exchange Online connector is not the route to use.' })
+                if ($mxInfo.splitHorizon) {
+                    $mxRows += New-StRow -Group 'MX' -Check 'Inside this network' -Result ($(if (@($mxInfo.localMx).Count) { @($mxInfo.localMx) -join ', ' } else { 'no MX at all' })) -Basis 'server-reported' -Status 'info' `
+                        -Detail 'The local DNS server answers differently from the internet - usually an Active Directory zone with the same name as the public domain. The public answer is used.'
+                }
+            } else {
+                $mxRows += New-StRow -Group 'MX' -Check ('MX for {0}' -f $dom) -Result 'Not found' -Status 'fail' -Detail $mxInfo.error
+            }
+            $mxState = if ($mxInfo.best) { 'measured' } else { 'failed' }
+            Publish 'mx' (New-StSection -State $mxState -Reason $(if ($mxInfo.best) { '' } else { $mxInfo.error }) -Method 'MX lookup against 1.1.1.1 and the local resolver' -Rows $mxRows -Data $mxInfo)
+            if ([string]::IsNullOrWhiteSpace($server)) {
+                if (-not $mxInfo.best) {
+                    Log ('No server was entered and no MX could be found for "{0}". Enter the From address, or the tenant host name, and try again.' -f $dom)
+                    $Shared.Done = $true
+                    return
+                }
+                $server = $mxInfo.best
+                $Shared.ResolvedServer = $server
+                Log ('Using the MX for {0}: {1}' -f $dom, $server)
+            }
+        }
 
         switch ($Job) {
 
@@ -3129,7 +3914,7 @@ $WorkerScript = {
 
                     if (Stopping) { break }
                     $Shared.Status = 'Auditing the certificate'
-                    $cert = Test-StCertificate -Server $server -Port $port -Security $security -HeloName $helo -Sink $sink -IoTimeoutMs $ioMs
+                    $cert = Test-StCertificate -Server $server -Port $port -Security $security -HeloName $helo -Sink $sink -IoTimeoutMs $ioMs -ExpectInternalCa $expectCa
                     Publish 'certificate' $cert
                     $n++; $Shared.Progress = [int](($n / $steps) * 100)
                     if ($cert.data -and $cert.data.interceptionSuspected) {
@@ -3140,24 +3925,47 @@ $WorkerScript = {
                     Publish 'publicIp' (Test-StPublicIp -IpSeenByServer $seenIp)
 
                     if (Stopping) { break }
+                    $passwordRejected = $false
                     if ($user -or $pass) {
                         $Shared.Status = 'Testing the credentials'
-                        $auth = Test-StAuth -Server $server -Port $port -Security $security -HeloName $helo -Username $user -Password $pass -Sink $sink -IoTimeoutMs $ioMs
+                        $auth = Test-StAuth -Server $server -Port $port -Security $security -HeloName $helo -Username $user -Password $pass -Sink $sink -IoTimeoutMs $ioMs -Kind $kind
                         Publish 'auth' $auth
                         if ($auth.data -and $auth.data.accepted) { Log 'The credentials were accepted.' }
-                        elseif ($auth.state -eq 'failed') { Log ('Authentication failed: {0}' -f $auth.reason) }
+                        elseif ($auth.state -eq 'failed') {
+                            Log ('Authentication failed: {0}' -f $auth.reason)
+                            if ($auth.data -and ($auth.data.code -eq 535 -or [string]$auth.data.text -match '\b5\.7\.(3|8|139)\b')) { $passwordRejected = $true }
+                        }
                     } else {
                         Publish 'auth' (New-StSection -State 'skipped' -Reason 'No credentials were entered. If the provider uses IP authentication that is correct - the Egress section is the check that matters instead.')
                     }
                     $n++; $Shared.Progress = [int](($n / $steps) * 100)
 
                     if (Stopping) { break }
-                    $Shared.Status = 'Offering the envelope (nothing is delivered)'
-                    $envSec = Test-StEnvelope -Server $server -Port $port -Security $security -HeloName $helo `
-                                              -Username $user -Password $pass -From $from -To $to -Sink $sink -IoTimeoutMs $ioMs
-                    Publish 'envelope' $envSec
-                    if ($envSec.data -and $envSec.data.accepted) { Log 'The server accepted the sender and the recipient. No message was delivered.' }
+                    if ($passwordRejected) {
+                        # Lockout guard: one rejected password per run.
+                        Publish 'envelope' (New-StSection -State 'skipped' -Reason 'Not attempted: the password was just rejected, and it is not tried a second time so an Active Directory account is not pushed towards lockout. Fix the password and run the sweep again.')
+                        Log 'Envelope skipped - the password is not retried after a rejection.'
+                    } else {
+                        $Shared.Status = 'Offering the envelope (nothing is delivered)'
+                        $envSec = Test-StEnvelope -Server $server -Port $port -Security $security -HeloName $helo `
+                                                  -Username $user -Password $pass -From $from -To $to -Sink $sink -IoTimeoutMs $ioMs -Kind $kind
+                        Publish 'envelope' $envSec
+                        if ($envSec.data -and $envSec.data.accepted) { Log 'The server accepted the sender and the recipient. No message was delivered.' }
+                    }
                     $n++; $Shared.Progress = [int](($n / $steps) * 100)
+
+                    if (Stopping) { break }
+                    if ($extTo) {
+                        $tcpSec = $Shared.Sections['tcp']
+                        $open = $true
+                        if ($tcpSec -and $tcpSec.data -and $tcpSec.data.ports) {
+                            $hit = @($tcpSec.data.ports | Where-Object { $_.port -eq $relayPort })
+                            if ($hit.Count -gt 0) { $open = [bool]$hit[0].open }
+                        }
+                        Invoke-Relay -PortOpen $open
+                    } elseif ($kind -eq 'exo-connector' -or $kind -eq 'exchange-onprem') {
+                        Publish 'relay' (New-StSection -State 'skipped' -Reason 'No external recipient was entered on the Relay tab, so the relay connector was not tested.')
+                    }
                 }
 
                 if (Stopping) { break }
@@ -3185,10 +3993,11 @@ $WorkerScript = {
                 $mx = Invoke-StAppMatrix -Server $server -Ports $ports -Username $user -Password $pass `
                                          -From $from -To $to -HeloName $helo `
                                          -TimeoutMs ([int]$Opt.MatrixTimeoutMs) -LiveSend ([bool]$Opt.MatrixLive) `
-                                         -Sink $sink -Shared $Shared
+                                         -Sink $sink -Shared $Shared -Kind $kind
                 Publish 'appMatrix' $mx
                 if ($mx.data) {
-                    Log ('{0} of {1} port and SSL combinations work.' -f $mx.data.workingCount, @($mx.data.cells).Count)
+                    Log ('{0} of {1} port and SSL combinations work, {2} of them encrypted.' -f $mx.data.workingCount, @($mx.data.cells).Count, $mx.data.secureWorkingCount)
+                    if ($mx.data.lockoutGuardTripped) { Log 'The password was rejected once and not tried again in this run.' }
                 }
                 $Shared.Progress = 100
             }
@@ -3197,7 +4006,7 @@ $WorkerScript = {
                 $Shared.Status = 'Reproducing the application''s send'
                 $sec = Test-StDotNetSmtpClient -Server $server -Port $port -EnableSsl ([bool]$Opt.EnableSsl) `
                                                -Username $user -Password $pass -From $from -To $to `
-                                               -TimeoutMs ([int]$Opt.ReproTimeoutMs) -Sink $sink
+                                               -TimeoutMs ([int]$Opt.ReproTimeoutMs) -Sink $sink -Kind $kind
                 Publish 'dotNetSmtpClient' $sec
                 if ($sec.state -eq 'measured') { Log 'System.Net.Mail.SmtpClient sent successfully with these settings.' }
                 else { Log ('System.Net.Mail.SmtpClient failed: {0}' -f $sec.reason) }
@@ -3207,10 +4016,29 @@ $WorkerScript = {
             'send' {
                 $Shared.Status = 'Sending a real message'
                 $sec = Test-StRawSend -Server $server -Port $port -Security $security -HeloName $helo `
-                                      -Username $user -Password $pass -From $from -To $to -Sink $sink -IoTimeoutMs ([math]::Max($ioMs, 30000))
+                                      -Username $user -Password $pass -From $from -To $to -Sink $sink -IoTimeoutMs ([math]::Max($ioMs, 30000)) -Kind $kind
                 Publish 'send' $sec
                 if ($sec.state -eq 'measured') { Log ('Message accepted by the server. Message-ID {0}' -f $sec.data.messageId) }
                 else { Log ('Send failed: {0}' -f $sec.reason) }
+                $Shared.Progress = 100
+            }
+
+            'relay' {
+                $Shared.Status = ('Checking port {0}' -f $relayPort)
+                $tp = Test-StTcpPort -Server $server -Port $relayPort -TimeoutMs 4000
+                if (-not $Shared.Sections['publicIp']) {
+                    $Shared.Status = 'Checking egress addresses'
+                    Publish 'publicIp' (Test-StPublicIp)
+                }
+                Invoke-Relay -PortOpen ([bool]$tp.open)
+                $Shared.Progress = 100
+            }
+
+            'autodiscover' {
+                $ad = Test-StAutodiscover -Email $from -TimeoutMs ([math]::Min($ioMs, 10000)) -Shared $Shared
+                Publish 'autodiscover' $ad
+                if ($ad.data -and $ad.data.answered) { Log ('Autodiscover answers for {0} via {1}{2}.' -f $from, $ad.data.answeredBy, $(if ($ad.data.mailboxLocation) { ' - mailbox ' + $ad.data.mailboxLocation } else { '' })) }
+                else { Log ('Nothing answers Autodiscover for {0}.' -f $from) }
                 $Shared.Progress = 100
             }
 
@@ -3230,7 +4058,7 @@ $WorkerScript = {
         $Shared.Status = 'Working out the verdict'
         $snapshot = @{}
         foreach ($k in @($Shared.Sections.Keys)) { $snapshot[$k] = $Shared.Sections[$k] }
-        $Shared.Verdict = Get-StVerdict -Sections $snapshot -Server $server -AppProfileName ([string]$Opt.AppProfile)
+        $Shared.Verdict = Get-StVerdict -Sections $snapshot -Server $server -AppProfileName ([string]$Opt.AppProfile) -Kind $kind
         $Shared.Version = $Shared.Version + 1
 
     } catch {
@@ -3649,6 +4477,65 @@ $appTop.Controls.Add($lblAppNote)
 $script:gridMatrix = New-StResultGrid
 $appLayout.Controls.Add($script:gridMatrix, 0, 1)
 
+# Relay & connectors tab
+$tabRelay = New-Object System.Windows.Forms.TabPage
+$tabRelay.Text = 'Relay & Autodiscover'
+$tabRelay.BackColor = [System.Drawing.Color]::White
+$script:tabs.TabPages.Add($tabRelay)
+
+$relLayout = New-Object System.Windows.Forms.TableLayoutPanel
+$relLayout.Dock = 'Fill'; $relLayout.ColumnCount = 1; $relLayout.RowCount = 2
+[void]$relLayout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 150)))
+[void]$relLayout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 100)))
+$tabRelay.Controls.Add($relLayout)
+
+$relTop = New-Object System.Windows.Forms.Panel
+$relTop.Dock = 'Fill'
+$relLayout.Controls.Add($relTop, 0, 0)
+
+$lblRelIntro = New-Object System.Windows.Forms.Label
+$lblRelIntro.Location = New-Object System.Drawing.Point(12, 10)
+$lblRelIntro.Size = New-Object System.Drawing.Size(1160, 48)
+$lblRelIntro.Font = New-Object System.Drawing.Font('Segoe UI', 9)
+$lblRelIntro.Text = @'
+Tests sending with NO credentials to an outside recipient - the route a scanner or application takes through an Exchange Online inbound connector (port 25 to the tenant MX, authorised by this site's public IP) or an on-prem Exchange anonymous relay connector. The recipient must be external: internal recipients are accepted with or without a connector. The session is reset before DATA, so nothing is delivered.
+'@
+$relTop.Controls.Add($lblRelIntro)
+
+$lblExt = New-StLabel -Text 'External recipient'
+$lblExt.Location = New-Object System.Drawing.Point(12, 70)
+$relTop.Controls.Add($lblExt)
+$script:txtExternalTo = New-StTextBox -W 260
+$script:txtExternalTo.Location = New-Object System.Drawing.Point(150, 66)
+$relTop.Controls.Add($script:txtExternalTo)
+$script:tips.SetToolTip($script:txtExternalTo, 'An address outside the organisation, for example your own. Nothing is delivered.')
+
+$lblConnIp = New-StLabel -Text 'Connector IP(s)'
+$lblConnIp.Location = New-Object System.Drawing.Point(430, 70)
+$relTop.Controls.Add($lblConnIp)
+$script:txtConnectorIps = New-StTextBox -W 240
+$script:txtConnectorIps.Location = New-Object System.Drawing.Point(540, 66)
+$relTop.Controls.Add($script:txtConnectorIps)
+$script:tips.SetToolTip($script:txtConnectorIps, 'Optional. The IP address(es) configured on the connector, comma separated. The test compares them with the address the server actually sees.')
+
+$script:btnRelay = New-StButton -Text 'Relay test' -W 120 -Tip 'Anonymous MAIL FROM / RCPT TO to the external recipient. Nothing is delivered.'
+$script:btnRelay.Location = New-Object System.Drawing.Point(800, 63)
+$relTop.Controls.Add($script:btnRelay)
+
+$script:btnAutodiscover = New-StButton -Text 'Autodiscover check' -W 150 -Tip 'Does anything answer Autodiscover for the From address, and where is the mailbox? Unauthenticated - no password is sent.'
+$script:btnAutodiscover.Location = New-Object System.Drawing.Point(930, 63)
+$relTop.Controls.Add($script:btnAutodiscover)
+
+$lblRelNote = New-Object System.Windows.Forms.Label
+$lblRelNote.Location = New-Object System.Drawing.Point(12, 104)
+$lblRelNote.Size = New-Object System.Drawing.Size(1160, 36)
+$lblRelNote.ForeColor = [System.Drawing.Color]::FromArgb(90, 90, 90)
+$lblRelNote.Text = 'For the Exchange Online connector, pick "Microsoft 365 - inbound connector (25)" and leave Server blank: the From domain''s MX is looked up through a public resolver. Run full sweep also runs this test whenever an external recipient is filled in.'
+$relTop.Controls.Add($lblRelNote)
+
+$script:gridRelay = New-StResultGrid
+$relLayout.Controls.Add($script:gridRelay, 0, 1)
+
 # Environment tab
 $tabEnvT = New-Object System.Windows.Forms.TabPage
 $tabEnvT.Text = 'Environment'
@@ -3719,7 +4606,7 @@ function Write-StLog {
 function Set-StBusy {
     param([bool]$On)
     $script:busy = $On
-    foreach ($b in @($script:btnSweep, $script:btnMatrix, $script:btnRepro, $script:btnSend, $script:btnEnv)) {
+    foreach ($b in @($script:btnSweep, $script:btnMatrix, $script:btnRepro, $script:btnSend, $script:btnEnv, $script:btnRelay, $script:btnAutodiscover)) {
         $b.Enabled = (-not $On)
     }
     $script:btnCancel.Enabled = $On
@@ -3733,9 +4620,30 @@ function Get-StSelectedPreset {
     return $script:Presets[$i]
 }
 
+function Set-StCueBanner {
+    # Grey placeholder text inside an empty TextBox (EM_SETCUEBANNER). Purely
+    # cosmetic, so any failure is ignored.
+    param($TextBox, [string]$Text)
+    try {
+        if (-not ('StNative.Cue' -as [type])) {
+            Add-Type -Namespace 'StNative' -Name 'Cue' -MemberDefinition @'
+[DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern System.IntPtr SendMessage(System.IntPtr hWnd, int msg, System.IntPtr wParam, string lParam);
+'@
+        }
+        [void][StNative.Cue]::SendMessage($TextBox.Handle, 0x1501, [System.IntPtr]1, $Text)
+    } catch { }
+}
+
 function Update-StPreset {
     $p = Get-StSelectedPreset
     if ($p.server) { $script:txtServer.Text = $p.server }
+    elseif ($p.kind -ne 'generic') {
+        # A preset with no fixed host (on-prem Exchange, the connector route)
+        # must not leave the previous preset's host sitting in the box.
+        $script:txtServer.Text = ''
+    }
+    Set-StCueBanner -TextBox $script:txtServer -Text $p.serverHint
+    $script:tips.SetToolTip($script:txtServer, $(if ($p.serverHint) { $p.serverHint } else { 'The mail server host name.' }))
     $ports = @(Get-StAllPorts -Preset $p)
     $script:txtPorts.Text = ($ports -join ', ')
     $current = $script:cboPort.Text
@@ -3777,8 +4685,15 @@ function Get-StSecurityMode {
 function Get-StUiOptions {
     param([string]$Job)
 
+    $preset = Get-StSelectedPreset
     $server = $script:txtServer.Text.Trim()
-    if (-not $server) {
+    if (-not $server -and $preset.kind -eq 'exo-connector') {
+        # Resolved from the From domain's MX by the worker.
+        if (-not (Test-StEmailAddress $script:txtFrom.Text.Trim())) {
+            [void][System.Windows.Forms.MessageBox]::Show('Enter the From address so its domain''s MX can be looked up, or type the tenant host name (for example contoso-com.mail.protection.outlook.com) into Server.', 'SMTP Toolkit', 'OK', 'Warning')
+            return $null
+        }
+    } elseif (-not $server) {
         [void][System.Windows.Forms.MessageBox]::Show('Enter the mail server name.', 'SMTP Toolkit', 'OK', 'Warning')
         return $null
     }
@@ -3801,6 +4716,19 @@ function Get-StUiOptions {
     # Only the jobs that actually need addresses insist on them, so a
     # connectivity check on a machine where nobody knows the sending address
     # still runs.
+    $extTo = $script:txtExternalTo.Text.Trim()
+    $connIps = @($script:txtConnectorIps.Text -split '[,;\s]+' | Where-Object { $_ -match '^\d{1,3}(\.\d{1,3}){3}$' })
+    if ($Job -eq 'autodiscover' -and -not (Test-StEmailAddress $from)) {
+        [void][System.Windows.Forms.MessageBox]::Show('Enter the From address - Autodiscover is looked up for that mailbox.', 'SMTP Toolkit', 'OK', 'Warning')
+        return $null
+    }
+    if ($Job -eq 'relay') {
+        if (-not (Test-StEmailAddress $from) -or -not (Test-StEmailAddress $extTo)) {
+            [void][System.Windows.Forms.MessageBox]::Show('The relay test needs a From address and an external recipient - an address outside this organisation, such as your own. Nothing is delivered.', 'SMTP Toolkit', 'OK', 'Warning')
+            return $null
+        }
+    }
+
     $needsAddresses = @('reproduce','send')
     if ($needsAddresses -contains $Job) {
         if (-not (Test-StEmailAddress $from) -or -not (Test-StEmailAddress $to)) {
@@ -3829,6 +4757,10 @@ function Get-StUiOptions {
         ReproTimeoutMs  = $reproMs
         ConfigBudgetSec = [int]$script:numConfig.Value
         AppProfile      = [string]$script:cboAppProfile.SelectedItem
+        ServerKind      = [string]$preset.kind
+        ExpectInternalCa= [bool]$preset.expectInternalCa
+        ExternalTo      = $extTo
+        ConnectorIps    = $connIps
     }
 }
 
@@ -3897,9 +4829,14 @@ function Start-StJob {
             'reproduce'   { ('Reproducing the application send: port {0}, SSL {1}, timeout {2:N0} s.' -f $opt.Port, $(if ($opt.EnableSsl) { 'ticked' } else { 'unticked' }), ($opt.ReproTimeoutMs / 1000)) }
             'send'        { ('Sending a test message via port {0}.' -f $opt.Port) }
             'environment' { 'Reading local settings only - no network traffic.' }
+            'relay'       { ('Relay test: no credentials, external recipient {0}. Nothing is delivered.' -f $opt.ExternalTo) }
+            'autodiscover'{ ('Autodiscover check for {0} - unauthenticated, no password is sent.' -f $opt.From) }
             default       { 'Started.' }
         }
         Write-StLog $startMsg
+        if ($opt.ServerKind -eq 'exchange-onprem' -and ($opt.Username -or $opt.Password) -and ($Job -eq 'sweep' -or $Job -eq 'matrix')) {
+            Write-StLog 'Exchange on-premises: the password is tried at most once per run and never again after a rejection, so the Active Directory account is not pushed towards lockout. Reproduce app send uses the real .NET class, which makes up to two attempts (Kerberos/NTLM, then LOGIN).'
+        }
     } catch {
         Write-StLog ('The background worker would not start: {0}' -f $_.Exception.Message)
         Set-StBusy -On $false
@@ -3920,6 +4857,9 @@ function Get-StSectionOrder {
     # wrapping it in @() and quietly getting a nested array.
     return @(
         @{ key = 'context';          title = 'This machine';            grid = 'results' }
+        @{ key = 'mx';               title = 'MX lookup';               grid = 'results' }
+        @{ key = 'relay';            title = 'Relay / connector';       grid = 'relay'   }
+        @{ key = 'autodiscover';     title = 'Autodiscover';            grid = 'relay'   }
         @{ key = 'dns';              title = 'DNS';                     grid = 'results' }
         @{ key = 'tcp';              title = 'Reachability';            grid = 'results' }
         @{ key = 'startTls';         title = 'STARTTLS';                grid = 'results' }
@@ -3940,7 +4880,7 @@ function Get-StSectionOrder {
 }
 
 function Update-StGrids {
-    $grids = @{ results = $script:gridResults; matrix = $script:gridMatrix; env = $script:gridEnv }
+    $grids = @{ results = $script:gridResults; matrix = $script:gridMatrix; env = $script:gridEnv; relay = $script:gridRelay }
     foreach ($g in $grids.Values) { $g.SuspendLayout(); $g.Rows.Clear() }
 
     foreach ($entry in (Get-StSectionOrder)) {
@@ -4063,7 +5003,10 @@ function New-StUiReport {
                            -Username $(if ($script:chkNoCreds.Checked) { '' } else { $script:txtUser.Text }) `
                            -HeloName $script:txtHelo.Text.Trim() `
                            -Ports (ConvertTo-StPortList -Text $script:txtPorts.Text) `
-                           -TimeoutMs (([int]$script:numTimeout.Value) * 1000)
+                           -TimeoutMs (([int]$script:numTimeout.Value) * 1000) `
+                           -Kind ([string](Get-StSelectedPreset).kind) `
+                           -ExternalTo $script:txtExternalTo.Text.Trim() `
+                           -ConnectorIps @($script:txtConnectorIps.Text -split '[,;\s]+' | Where-Object { $_ })
 
     $dur = 0
     if ($script:startedSw) { $dur = $script:startedSw.Elapsed.TotalSeconds }
@@ -4126,6 +5069,9 @@ $script:timer.Add_Tick({
         $script:timer.Stop()
         Complete-StWorker
         Set-StBusy -On $false
+        # The connector route resolves its host from the MX; show it, so the
+        # next run (and the report) uses the same host.
+        if ($sh.ResolvedServer -and -not $script:txtServer.Text.Trim()) { $script:txtServer.Text = [string]$sh.ResolvedServer }
         foreach ($k in @($sh.Sections.Keys)) { $script:Sections[$k] = $sh.Sections[$k] }
         if ($sh.Verdict) { $script:Verdict = $sh.Verdict }
         Update-StGrids
@@ -4165,6 +5111,8 @@ $script:btnMatrix.Add_Click({ Start-StJob -Job 'matrix' })
 $script:btnRepro.Add_Click({ Start-StJob -Job 'reproduce' })
 $script:btnSend.Add_Click({ Start-StJob -Job 'send' })
 $script:btnEnv.Add_Click({ Start-StJob -Job 'environment' })
+$script:btnRelay.Add_Click({ Start-StJob -Job 'relay' })
+$script:btnAutodiscover.Add_Click({ Start-StJob -Job 'autodiscover' })
 
 $script:btnCancel.Add_Click({
     if ($script:Shared) {

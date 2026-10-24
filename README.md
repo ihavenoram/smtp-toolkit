@@ -13,10 +13,10 @@ Smtp-Toolkit.ps1           <- the tool, one self-contained file
 
 ## Download
 
-Grab the latest zip from **[Releases](../../releases/latest)**. The SHA-256 checksum is in the release notes and in the `.sha256` file beside the zip:
+Grab **`smtp.zip`** from **[Releases](../../releases/latest)**. It holds one folder, `smtp\`, with only what runs: the scripts and a `.cmd` launcher for each. Copy that folder to the PC or server (for example `C:\temp\smtp`); this README and the docs stay here on GitHub. The SHA-256 checksum is in the release notes and in the `.sha256` file beside the zip:
 
 ```powershell
-Get-FileHash .\SMTP-Toolkit.zip -Algorithm SHA256
+Get-FileHash .\smtp.zip -Algorithm SHA256
 ```
 
 Run it with the launcher. WinForms needs `-STA`, and the launcher supplies it:
